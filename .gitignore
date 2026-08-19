@@ -1,0 +1,48 @@
+# docs and spec — kept out of the repo
+/*.md
+/flow/
+
+# build output
+/target/
+/src-tauri/target/
+/ui/dist/
+/ui/build/
+/dist/
+/build/
+/go/bin/
+pippod
+*.exe
+
+# dependencies
+node_modules/
+/vendor/
+
+# environment and secrets
+.env
+.env.*
+*.pem
+*.key
+
+# os
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+desktop.ini
+
+# editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# temp and logs
+*.log
+*.tmp
+*.temp
+*.bak
+tmp/
+.cache/
+coverage/
