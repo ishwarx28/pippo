@@ -38,6 +38,21 @@
   --focus-w: 2px;
   --focus-offset: 2px;
   --motion-off: 0ms;
+  --viewport-height: 100dvh;
+  --full: 100%;
+  --fill: 1fr;
+  --grow: 1;
+  --header-height: 48px;
+  --composer-input-min: 52px;
+  --composer-input-max: 160px;
+  --status-dot: 6px;
+  --disabled-opacity: 0.55;
+  --hover-opacity: 0.86;
+  --pending-opacity: 0.6;
+  --opaque: 1;
+  --pulse-time: 1.2s;
+  --a11y-size: 1px;
+  --a11y-offset: -1px;
   color-scheme: light;
 }
 

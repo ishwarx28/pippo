@@ -9,6 +9,7 @@
     "preview": "vite preview --port 1420 --strictPort"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },

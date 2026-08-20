@@ -1,0 +1,72 @@
+/* Owns shared primitive control presentation. */
+.button {
+  min-height: var(--hit);
+  padding: var(--s1) var(--s3);
+  border: var(--line-w) solid currentColor;
+  border-radius: var(--r-sm);
+  font: 500 var(--t-sm) var(--sans);
+  cursor: pointer;
+  transition: opacity var(--fast) var(--ease);
+}
+
+.button:hover:not(:disabled) {
+  opacity: var(--hover-opacity);
+}
+
+.button:disabled {
+  cursor: not-allowed;
+  opacity: var(--disabled-opacity);
+}
+
+.button--primary {
+  border-color: var(--accent);
+  color: var(--bg);
+  background: var(--accent);
+}
+
+.button--danger {
+  color: var(--bad);
+  background: var(--bg);
+}
+
+.field {
+  position: relative;
+  display: block;
+  min-width: var(--r);
+}
+
+.field__label,
+.sr-only {
+  position: absolute;
+  width: var(--a11y-size);
+  height: var(--a11y-size);
+  padding: var(--r);
+  margin: var(--a11y-offset);
+  overflow: hidden;
+  clip-path: inset(var(--full));
+  white-space: nowrap;
+  border: var(--r);
+}
+
+.field__input {
+  display: block;
+  width: var(--full);
+  min-height: var(--composer-input-min);
+  max-height: var(--composer-input-max);
+  padding: var(--s2) var(--s3);
+  resize: vertical;
+  border: var(--line-w) solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--text);
+  background: var(--surface);
+  font: 400 var(--t-md) var(--sans);
+}
+
+.field__input::placeholder {
+  color: var(--dim);
+}
+
+.field__input:disabled {
+  cursor: not-allowed;
+  opacity: var(--disabled-opacity);
+}

@@ -1,14 +1,134 @@
-/* Owns the minimal app shell layout. */
+/* Owns conversation layout and presentation. */
 .shell {
-  min-height: 100%;
   display: grid;
-  place-items: center;
+  grid-template-rows: var(--header-height) minmax(var(--r), var(--fill)) auto auto;
+  height: var(--viewport-height);
   background: var(--bg);
+  overflow: hidden;
 }
 
-.wordmark {
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-width: var(--r);
+  padding: var(--r) var(--s4);
+  border-bottom: var(--line-w) solid var(--line);
+  background: var(--surface);
+  user-select: none;
+}
+
+.header__wordmark {
   margin: var(--r);
   font: 600 var(--t-lg) var(--sans);
   letter-spacing: var(--wordmark-track);
-  user-select: none;
+}
+
+.header__status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s2);
+  color: var(--dim);
+  font: 500 var(--t-sm) var(--sans);
+}
+
+.status-dot {
+  width: var(--status-dot);
+  height: var(--status-dot);
+  border-radius: var(--full);
+  background: var(--dim);
+}
+
+.status-dot--running {
+  background: var(--run);
+  animation: pulse var(--pulse-time) var(--ease) infinite alternate;
+}
+
+.transcript {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s4);
+  min-height: var(--r);
+  padding: var(--s4);
+  overflow-y: auto;
+  scroll-behavior: auto;
+}
+
+.transcript__empty {
+  margin: auto;
+  color: var(--dim);
+}
+
+.message {
+  width: var(--full);
+  margin: var(--r);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.message--user {
+  padding: var(--s3);
+  background: var(--surface);
+}
+
+.message--assistant {
+  padding: var(--r) var(--s3);
+}
+
+.message__pending {
+  display: block;
+  width: var(--status-dot);
+  height: var(--status-dot);
+  border-radius: var(--full);
+  background: var(--run);
+  animation: pulse var(--pulse-time) var(--ease) infinite alternate;
+}
+
+.message__state {
+  margin: var(--s2) var(--r) var(--r);
+  color: var(--dim);
+  font: 400 var(--t-sm) var(--sans);
+}
+
+.message__error {
+  padding-left: var(--s2);
+  border-left: var(--focus-w) solid var(--bad);
+  color: var(--bad);
+}
+
+.notice {
+  margin: var(--r);
+  padding: var(--s2) var(--s4);
+  border-left: var(--focus-w) solid var(--bad);
+  color: var(--bad);
+  background: var(--surface);
+}
+
+.composer {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--s2);
+  padding: var(--s3) var(--s4);
+  border-top: var(--line-w) solid var(--line);
+  background: var(--bg);
+}
+
+.composer .field {
+  flex: var(--grow);
+}
+
+@keyframes pulse {
+  from {
+    opacity: var(--pending-opacity);
+  }
+  to {
+    opacity: var(--opaque);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status-dot--running,
+  .message__pending {
+    animation: none;
+  }
 }
