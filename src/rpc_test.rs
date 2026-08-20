@@ -18,7 +18,7 @@ fn shared(root: &Path) -> (Shared, mpsc::Receiver<Interaction>) {
             clarify: Mutex::new(ClarifyState::default()),
             approval: Mutex::new(ApprovalState::default()),
             sheet: Mutex::new(SheetState::default()),
-            key: Key,
+            key: Key::new(root.to_path_buf()),
             proj: Arc::new(Proj::open(root.to_path_buf()).unwrap()),
             runs: Runs::open(root.to_path_buf()).unwrap(),
             rules: rule::Book::open(root, root).unwrap(),

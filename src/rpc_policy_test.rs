@@ -36,7 +36,7 @@ impl Harness {
             clarify: Mutex::new(ClarifyState::default()),
             approval: Mutex::new(ApprovalState::default()),
             sheet: Mutex::new(SheetState::default()),
-            key: Key,
+            key: Key::new(root.clone()),
             proj: Arc::new(Proj::open(root.clone()).unwrap()),
             runs: Runs::open(root.clone()).unwrap(),
             rules: rule::Book::open(&root, &root).unwrap(),

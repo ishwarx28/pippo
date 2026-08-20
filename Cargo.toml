@@ -13,7 +13,6 @@ futures-util = { version = "0.3.34", features = ["sink"] }
 getrandom = "0.3"
 globset = "0.4"
 ignore = "0.4"
-keyring = "4.1.6"
 libc = "0.2"
 regex = "1"
 serde = { version = "1", features = ["derive"] }

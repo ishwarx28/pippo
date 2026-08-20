@@ -21,7 +21,8 @@ export function ModelKeyCard({ value, saving, error, onChange, onSubmit }: Props
   return (
     <Card title="Connect a model" tone="wait">
       <p className="model-key-card__copy">
-        Add your Gemini API key to start chatting. It is stored only in the system keychain.
+        Add your Gemini API key to start chatting. It is stored only on this Mac, in a private file
+        agents cannot read.
       </p>
       <form className="model-key-card__form" onSubmit={submit}>
         <Field

@@ -246,12 +246,12 @@ fn run() -> Result<()> {
     let proj = Arc::new(proj::Proj::open(root.clone())?);
     let rules = rule::Book::open(&root, &cfg::home()?)?;
     let spawned = Service::spawn()?;
-    let key = key::Key;
+    let key = key::Key::new(root.clone());
     let rpc = rpc::Rpc::connect(
         spawned.addr,
         spawned.token,
         &rpc::Hello::new(&root, &cfg)?,
-        key,
+        key.clone(),
         Arc::clone(&proj),
         rules,
     )?;
@@ -332,7 +332,7 @@ mod tests {
             spawned.addr,
             spawned.token.clone(),
             &hello,
-            key::Key,
+            key::Key::new(root.clone()),
             Arc::clone(&proj),
             rule::Book::open(&root, &root).unwrap(),
         )
@@ -341,7 +341,7 @@ mod tests {
             spawned.addr,
             spawned.token,
             &hello,
-            key::Key,
+            key::Key::new(root.clone()),
             proj,
             rule::Book::open(&root, &root).unwrap()
         )
@@ -391,7 +391,7 @@ mod tests {
             spawned.addr,
             spawned.token,
             &hello,
-            key::Key,
+            key::Key::new(root.clone()),
             proj,
             rule::Book::open(&root, &root).unwrap(),
         )
