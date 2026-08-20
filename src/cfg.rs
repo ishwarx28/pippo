@@ -179,11 +179,11 @@ pub struct Account {
     pub uid: Option<String>,
 }
 
-pub fn load() -> Result<Config> {
+pub fn root() -> Result<PathBuf> {
     let home = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .context("home directory is unavailable")?;
-    load_at(PathBuf::from(home).join(".pippo"))
+    Ok(PathBuf::from(home).join(".pippo"))
 }
 
 pub fn load_at(root: PathBuf) -> Result<Config> {
