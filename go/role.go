@@ -153,26 +153,3 @@ func allows(role, tool string) bool {
 		return false
 	}
 }
-
-type steps struct {
-	used, max int
-	warned    bool
-}
-
-func (s *steps) take() (bool, error) {
-	if s.used >= s.max {
-		return false, s.limit()
-	}
-	s.used++
-	if !s.warned && s.used*5 >= s.max*4 {
-		s.warned = true
-		return true, nil
-	}
-	return false, nil
-}
-
-func (s *steps) room(count int) bool { return count >= 0 && s.used+count <= s.max }
-
-func (s *steps) limit() error { return fmt.Errorf("limit: %d-step budget reached", s.max) }
-
-const convergeNotice = "Step budget is 80% used. Converge and write the final report."

@@ -131,21 +131,21 @@ func TestRoleDispatchDeniesUndeclaredToolsBeforeRPC(t *testing.T) {
 }
 
 func TestStepBudgetWarnsOnceAndStops(t *testing.T) {
-	budget := steps{max: 5}
+	budget := newGuard(workerRole, 5)
 	warnings := 0
 	for index := 0; index < 5; index++ {
-		warn, err := budget.take()
+		notice, err := budget.step()
 		if err != nil {
 			t.Fatal(err)
 		}
-		if warn {
+		if notice != "" {
 			warnings++
 		}
 	}
 	if warnings != 1 || budget.room(1) {
 		t.Fatalf("budget = %#v, warnings = %d", budget, warnings)
 	}
-	if _, err := budget.take(); err == nil || err.Error() != "limit: 5-step budget reached" {
+	if _, err := budget.step(); err == nil || err.Error() != "limit: 5-step budget reached" {
 		t.Fatalf("hard limit = %v", err)
 	}
 }
@@ -185,7 +185,7 @@ func TestSubagentLoopCarriesRoleConfigAndCountsEveryStep(t *testing.T) {
 	}
 	warnings := 0
 	for _, message := range requests[2].History {
-		if message.Text == convergeNotice {
+		if message.Text == subagentBudgetNotice {
 			warnings++
 		}
 	}

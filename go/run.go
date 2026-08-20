@@ -103,7 +103,7 @@ type agentRun struct {
 	epoch     uint64
 	media     []numberedMedia
 	role      role
-	budget    steps
+	budget    guard
 }
 
 type runSet struct {
@@ -258,7 +258,8 @@ func (s *runSet) spawn(
 		return runOutput{}, errors.New("runtime returned inconsistent run metadata")
 	}
 	run := &agentRun{
-		meta: meta, depth: depth, peer: peer, media: media, role: current, budget: steps{max: current.Steps},
+		meta: meta, depth: depth, peer: peer, media: media, role: current,
+		budget: newGuard(current.Name, current.Steps),
 		request: assemble(current.Model, prompt{SystemPrompt: current.Prompt, ToolDeclarations: toolText,
 			StaticEnvironment: current.Static, Query: runQuery(meta)}),
 	}
@@ -385,7 +386,7 @@ func (s *runSet) resume(ctx context.Context, parent string, args subagentArgs) (
 	run.meta.Status, run.meta.Attempt, run.report = runRunning, attempt, ""
 	run.questions = nil
 	if restart {
-		run.budget = steps{max: run.role.Steps}
+		run.budget = newGuard(run.role.Name, run.role.Steps)
 	}
 	s.startLocked(run)
 	result := output(run)
@@ -516,7 +517,9 @@ func (s *runSet) execute(ctx context.Context, id string, epoch uint64) {
 	}
 	if err != nil {
 		status = runFailed
-		if run.report == "" {
+		if errors.Is(err, emptyFailure) && run.report != "" {
+			run.report = strings.TrimSpace(run.report) + "\n\nStopped: " + err.Error()
+		} else if run.report == "" {
 			run.report = err.Error()
 		}
 	}
@@ -542,51 +545,55 @@ func (s *runSet) run(
 	attempt int,
 	current role,
 	request model.Request,
-	budget *steps,
+	budget *guard,
 ) (model.Request, string, error) {
 	last := ""
 	callID := callID{Turn: id, Request: fmt.Sprintf("%s_%d", id, attempt)}
 	for {
-		warn, err := budget.take()
+		notice, err := budget.decision()
 		if err != nil {
 			return request, last, err
 		}
-		if warn {
-			request.History = append(request.History, model.Message{Role: "user", Text: convergeNotice})
+		if notice != "" {
+			request.History = append(request.History, model.Message{Role: "user", Text: notice})
 		}
 		if err := refreshLive(ctx, peer, &request, task, s); err != nil {
 			return request, last, err
 		}
-		var text strings.Builder
-		var calls []model.Call
-		seen := make(map[string]bool)
-		err = s.provider.Stream(ctx, key, request, func(value model.Chunk) error {
-			text.WriteString(value.Text)
-			if value.Call != nil {
-				identity, encode := json.Marshal(value.Call)
-				if encode != nil {
-					return fmt.Errorf("encode tool call: %w", encode)
-				}
-				if !seen[string(identity)] {
-					seen[string(identity)] = true
-					calls = append(calls, *value.Call)
-				}
-			}
-			return nil
-		})
-		last = text.String()
-		if err != nil || len(calls) == 0 {
+		reply, err := collectReply(ctx, s.provider, key, request, nil)
+		if strings.TrimSpace(reply.text) != "" {
+			last = reply.text
+		}
+		if err != nil {
 			return request, last, err
 		}
-		request.History = append(request.History, model.Message{Role: "model", Text: last, Calls: calls})
-		if !budget.room(len(calls)) {
+		notice, err = budget.reply(reply.text, reply.calls)
+		if err != nil {
+			return request, last, err
+		}
+		if notice != "" {
+			request.History = append(request.History, model.Message{Role: "user", Text: notice})
+			continue
+		}
+		if len(reply.calls) == 0 {
+			return request, last, nil
+		}
+		request.History = append(request.History, model.Message{Role: "model", Text: reply.text, Calls: reply.calls})
+		keys, err := signatures(reply.calls)
+		if err != nil {
+			return request, last, err
+		}
+		if !budget.room(len(reply.calls)) {
 			return request, last, budget.limit()
 		}
-		results := make([]model.Result, 0, len(calls))
-		warn = false
-		for _, call := range calls {
-			crossed, _ := budget.take()
-			warn = warn || crossed
+		results := make([]model.Result, 0, len(reply.calls))
+		var notices []string
+		for index, call := range reply.calls {
+			guardNotices, err := budget.tool(keys[index])
+			if err != nil {
+				return request, last, err
+			}
+			notices = append(notices, guardNotices...)
 			result := execTool(ctx, peer, s, current.Name, callID, task, call)
 			if result.Err != nil {
 				return request, last, result.Err
@@ -594,8 +601,8 @@ func (s *runSet) run(
 			results = append(results, result)
 		}
 		request.History = append(request.History, model.Message{Role: "user", Results: results})
-		if warn {
-			request.History = append(request.History, model.Message{Role: "user", Text: convergeNotice})
+		for _, notice := range notices {
+			request.History = append(request.History, model.Message{Role: "user", Text: notice})
 		}
 	}
 }

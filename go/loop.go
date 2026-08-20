@@ -228,54 +228,53 @@ func (l *loop) stream(ctx context.Context, peer *rpc, id callID, request model.R
 }
 
 func (l *loop) run(ctx context.Context, peer *rpc, key string, request *model.Request, id callID, current role) error {
-	budget := steps{max: current.Steps}
+	budget := newGuard(current.Name, current.Steps)
 	for {
-		warn, err := budget.take()
+		notice, err := budget.decision()
 		if err != nil {
 			return err
 		}
-		if warn {
-			request.History = append(request.History, model.Message{Role: "user", Text: convergeNotice})
+		if notice != "" {
+			request.History = append(request.History, model.Message{Role: "user", Text: notice})
 		}
 		if err := refreshLive(ctx, peer, request, "", l.agents); err != nil {
 			return err
 		}
-		var text strings.Builder
-		var calls []model.Call
-		seen := make(map[string]bool)
-		err = l.provider.Stream(ctx, key, *request, func(value model.Chunk) error {
-			if value.Text != "" {
-				text.WriteString(value.Text)
-				if err := peer.notify("turn.chunk", chunk{callID: id, Text: value.Text}); err != nil {
-					return err
-				}
-			}
-			if value.Call != nil {
-				identity, err := json.Marshal(value.Call)
-				if err != nil {
-					return fmt.Errorf("encode tool call: %w", err)
-				}
-				if !seen[string(identity)] {
-					seen[string(identity)] = true
-					calls = append(calls, *value.Call)
-				}
-			}
-			return nil
+		reply, err := collectReply(ctx, l.provider, key, *request, func(text string) error {
+			return peer.notify("turn.chunk", chunk{callID: id, Text: text})
 		})
-		if err != nil || len(calls) == 0 {
+		if err != nil {
 			return err
 		}
+		notice, err = budget.reply(reply.text, reply.calls)
+		if err != nil {
+			return err
+		}
+		if notice != "" {
+			request.History = append(request.History, model.Message{Role: "user", Text: notice})
+			continue
+		}
+		if len(reply.calls) == 0 {
+			return nil
+		}
 		request.History = append(request.History, model.Message{
-			Role: "model", Text: text.String(), Calls: calls,
+			Role: "model", Text: reply.text, Calls: reply.calls,
 		})
-		if !budget.room(len(calls)) {
+		keys, err := signatures(reply.calls)
+		if err != nil {
+			return err
+		}
+		if !budget.room(len(reply.calls)) {
 			return budget.limit()
 		}
-		results := make([]model.Result, 0, len(calls))
-		warn = false
-		for _, call := range calls {
-			crossed, _ := budget.take()
-			warn = warn || crossed
+		results := make([]model.Result, 0, len(reply.calls))
+		var notices []string
+		for index, call := range reply.calls {
+			guardNotices, err := budget.tool(keys[index])
+			if err != nil {
+				return err
+			}
+			notices = append(notices, guardNotices...)
 			result := execTool(ctx, peer, l.agents, current.Name, id, "", call)
 			if result.Err != nil {
 				return result.Err
@@ -283,8 +282,8 @@ func (l *loop) run(ctx context.Context, peer *rpc, key string, request *model.Re
 			results = append(results, result)
 		}
 		request.History = append(request.History, model.Message{Role: "user", Results: results})
-		if warn {
-			request.History = append(request.History, model.Message{Role: "user", Text: convergeNotice})
+		for _, notice := range notices {
+			request.History = append(request.History, model.Message{Role: "user", Text: notice})
 		}
 	}
 }

@@ -55,6 +55,7 @@ type runtimeRuns struct {
 	mu         sync.Mutex
 	next       int
 	finds      int
+	tasks      int
 	failResume bool
 	entries    map[string]runMeta
 	creates    []runCreate
@@ -131,6 +132,12 @@ func runHarness(t *testing.T, provider model.Provider) (*runSet, *rpc, *runtimeR
 			runtime.finds++
 			runtime.mu.Unlock()
 			return map[string]any{"ok": true, "kind": "search", "hits": []any{}}, nil
+		},
+		"runtime.task": func(context.Context, *rpc, json.RawMessage) (any, error) {
+			runtime.mu.Lock()
+			runtime.tasks++
+			runtime.mu.Unlock()
+			return map[string]any{"task_id": "t_1234abcd", "status": "running"}, nil
 		},
 		"runtime.run": func(ctx context.Context, peer *rpc, raw json.RawMessage) (any, error) {
 			var action struct {
