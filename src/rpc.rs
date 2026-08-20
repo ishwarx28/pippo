@@ -590,10 +590,7 @@ fn dispatch(
                     code: -32001,
                     message: "model key is missing".into(),
                 }),
-                Err(error) => Err(Failure {
-                    code: -32603,
-                    message: error.to_string(),
-                }),
+                Err(error) => Err(internal_failure(error)),
             },
             "runtime.task" => task(&shared, input.params),
             "runtime.live_env" => live(&shared, input.params),
@@ -671,18 +668,10 @@ fn start_clarify(
     let Some(id) = id else {
         return;
     };
-    let input: ClarifyInput = match serde_json::from_value(params.unwrap_or(Value::Null)) {
+    let input: ClarifyInput = match decode(params, "clarify request") {
         Ok(input) => input,
         Err(error) => {
-            respond(
-                output,
-                id,
-                None,
-                Some(Failure {
-                    code: -32602,
-                    message: format!("decode clarify request: {error}"),
-                }),
-            );
+            respond(output, id, None, Some(error));
             return;
         }
     };
@@ -720,10 +709,7 @@ fn start_clarify(
                 output,
                 id,
                 None,
-                Some(Failure {
-                    code: -32603,
-                    message: "clarification lock poisoned".into(),
-                }),
+                Some(internal_failure("clarification lock poisoned")),
             );
             return;
         }
@@ -735,15 +721,7 @@ fn start_clarify(
         },
     ) {
         let _ = resolve_clarify(&shared, &prompt.id, Err(error.clone()));
-        respond(
-            output,
-            id,
-            None,
-            Some(Failure {
-                code: -32603,
-                message: error,
-            }),
-        );
+        respond(output, id, None, Some(internal_failure(error)));
         return;
     }
     thread::spawn(move || {
@@ -753,10 +731,7 @@ fn start_clarify(
                 code: -32003,
                 message: error,
             }),
-            Err(_) => Err(Failure {
-                code: -32603,
-                message: "clarification waiter closed".into(),
-            }),
+            Err(_) => Err(internal_failure("clarification waiter closed")),
         };
         match result {
             Ok(value) => respond(output, id, Some(value), None),
@@ -767,17 +742,15 @@ fn start_clarify(
 
 fn check_clarify(input: &ClarifyInput) -> std::result::Result<(), Failure> {
     if input.turn_id.trim().is_empty() || input.request_id.trim().is_empty() {
-        return Err(Failure {
-            code: -32602,
-            message: "clarification requires turn and request ids".into(),
-        });
+        return Err(invalid_failure(
+            "clarification requires turn and request ids",
+        ));
     }
     let question = input.question.trim();
     if question.is_empty() || question.contains(['\r', '\n']) || input.options.len() > 8 {
-        return Err(Failure {
-            code: -32602,
-            message: "clarification question or options are invalid".into(),
-        });
+        return Err(invalid_failure(
+            "clarification question or options are invalid",
+        ));
     }
     let mut recommended = 0;
     let mut labels = std::collections::HashSet::new();
@@ -791,31 +764,24 @@ fn check_clarify(input: &ClarifyInput) -> std::result::Result<(), Failure> {
                 recommended > 1
             }
         {
-            return Err(Failure {
-                code: -32602,
-                message: "clarification options are invalid".into(),
-            });
+            return Err(invalid_failure("clarification options are invalid"));
         }
     }
     Ok(())
 }
 
 fn cancel_clarify(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
-    let input: ClarifyInput =
-        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
-            code: -32602,
-            message: format!("decode clarification cancellation: {error}"),
-        })?;
+    let input: ClarifyInput = decode(params, "clarification cancellation")?;
     let key = ClarifyKey {
         turn: input.turn_id,
         request: input.request_id,
         call: input.call_id,
     };
     let pending = {
-        let mut state = shared.clarify.lock().map_err(|_| Failure {
-            code: -32603,
-            message: "clarification lock poisoned".into(),
-        })?;
+        let mut state = shared
+            .clarify
+            .lock()
+            .map_err(|_| internal_failure("clarification lock poisoned"))?;
         match state.active.as_ref().filter(|pending| pending.key == key) {
             Some(_) => state.active.take(),
             None => None,
@@ -872,10 +838,10 @@ fn sentence(value: &str) -> String {
 }
 
 fn open_sheet(shared: &Shared, prefix: &str) -> std::result::Result<String, Failure> {
-    let mut sheet = shared.sheet.lock().map_err(|_| Failure {
-        code: -32603,
-        message: "interaction lock poisoned".into(),
-    })?;
+    let mut sheet = shared
+        .sheet
+        .lock()
+        .map_err(|_| internal_failure("interaction lock poisoned"))?;
     if sheet.active.is_some() {
         return Err(Failure {
             code: -32002,
@@ -914,6 +880,13 @@ struct GateFailure {
     message: String,
 }
 
+fn busy_gate(message: impl Into<String>) -> GateFailure {
+    GateFailure {
+        reason: find::Reason::Busy,
+        message: message.into(),
+    }
+}
+
 fn gate(
     shared: &Shared,
     request: RuleRequest<'_>,
@@ -934,10 +907,7 @@ fn gate(
         }
         Decision::Ask(ask) => ask,
     };
-    let id = open_sheet(shared, "approval").map_err(|error| GateFailure {
-        reason: find::Reason::Busy,
-        message: error.message,
-    })?;
+    let id = open_sheet(shared, "approval").map_err(|error| busy_gate(error.message))?;
     let prompt = ask.prompt(id.clone());
     let (answer, received) = mpsc::sync_channel(1);
     let pending = ApprovalPending {
@@ -950,18 +920,12 @@ fn gate(
         Ok(mut state) => state.active = Some(pending),
         Err(_) => {
             close_sheet(shared, &id);
-            return Err(GateFailure {
-                reason: find::Reason::Busy,
-                message: "approval lock poisoned".into(),
-            });
+            return Err(busy_gate("approval lock poisoned"));
         }
     }
     if let Err(error) = emit_interaction(shared, Interaction::ApprovalOpened { prompt }) {
         let _ = resolve_approval(shared, &id, Err(error.clone()));
-        return Err(GateFailure {
-            reason: find::Reason::Busy,
-            message: error,
-        });
+        return Err(busy_gate(error));
     }
     match received.recv() {
         Ok(Ok(ApprovalChoice::AllowOnce | ApprovalChoice::AllowSession)) => Ok(()),
@@ -1012,11 +976,7 @@ fn resolve_approval(shared: &Shared, id: &str, answer: ApprovalAnswer) -> Result
 }
 
 fn cancel_approval(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
-    let input: shell::Cancel =
-        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
-            code: -32602,
-            message: format!("decode approval cancellation: {error}"),
-        })?;
+    let input: shell::Cancel = decode(params, "approval cancellation")?;
     let key = ApprovalKey {
         turn: input.turn_id,
         request: input.request_id,
@@ -1025,10 +985,7 @@ fn cancel_approval(shared: &Shared, params: Option<Value>) -> std::result::Resul
     let id = shared
         .approval
         .lock()
-        .map_err(|_| Failure {
-            code: -32603,
-            message: "approval lock poisoned".into(),
-        })?
+        .map_err(|_| internal_failure("approval lock poisoned"))?
         .active
         .as_ref()
         .filter(|pending| pending.key == key)
@@ -1070,23 +1027,13 @@ enum TaskInput {
 }
 
 fn task(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
-    let input: TaskInput =
-        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
-            code: -32602,
-            message: format!("decode task request: {error}"),
-        })?;
+    let input: TaskInput = decode(params, "task request")?;
     let result = match input {
         TaskInput::Create { title, path } => shared.proj.create(title, path),
         TaskInput::Update { id, status, note } => shared.proj.update(id, status, note),
     }
-    .map_err(|error| Failure {
-        code: -32602,
-        message: error.to_string(),
-    })?;
-    serde_json::to_value(result).map_err(|error| Failure {
-        code: -32603,
-        message: format!("encode task result: {error}"),
-    })
+    .map_err(invalid_failure)?;
+    encode(result, "task result")
 }
 
 #[derive(Deserialize)]
@@ -1096,22 +1043,12 @@ struct LiveInput {
 }
 
 fn live(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
-    let input: LiveInput =
-        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
-            code: -32602,
-            message: format!("decode live environment request: {error}"),
-        })?;
+    let input: LiveInput = decode(params, "live environment request")?;
     let value = shared
         .proj
         .live(input.task_id.as_deref())
-        .map_err(|error| Failure {
-            code: -32603,
-            message: error.to_string(),
-        })?;
-    serde_json::to_value(value).map_err(|error| Failure {
-        code: -32603,
-        message: format!("encode live environment: {error}"),
-    })
+        .map_err(internal_failure)?;
+    encode(value, "live environment")
 }
 
 #[derive(Deserialize)]
@@ -1149,11 +1086,7 @@ struct RunReply {
 }
 
 fn run(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
-    let input: RunInput =
-        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
-            code: -32602,
-            message: format!("decode run request: {error}"),
-        })?;
+    let input: RunInput = decode(params, "run request")?;
     match input {
         RunInput::Create {
             parent_id,
@@ -1206,8 +1139,7 @@ fn run(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fai
                     highlight,
                 })
                 .map_err(invalid_failure)?;
-            serde_json::to_value(RunReply { meta, reports })
-                .map_err(|error| internal_failure(error.into()))
+            encode(RunReply { meta, reports }, "run metadata")
         }
         RunInput::Update {
             id,
@@ -1219,33 +1151,21 @@ fn run(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fai
                 .runs
                 .update(&id, status, attempt, report)
                 .map_err(invalid_failure)?;
-            serde_json::to_value(meta).map_err(|error| internal_failure(error.into()))
+            encode(meta, "run metadata")
         }
     }
 }
 
 fn find(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
-    let input: find::Input =
-        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
-            code: -32602,
-            message: format!("decode find request: {error}"),
-        })?;
+    let input: find::Input = decode(params, "find request")?;
     let scope = shared
         .proj
         .scope(input.task_id.as_deref())
-        .map_err(|error| Failure {
-            code: -32602,
-            message: error.to_string(),
-        })?;
+        .map_err(invalid_failure)?;
     let key = match (input.turn_id.clone(), input.request_id.clone()) {
         (Some(turn), Some(request)) => Some(write::Key::new(turn, request).map_err(tool_failure)?),
         (None, None) => None,
-        _ => {
-            return Err(Failure {
-                code: -32602,
-                message: "find run identity is incomplete".into(),
-            })
-        }
+        _ => return Err(invalid_failure("find run identity is incomplete")),
     };
     let target = scope.resolve(input.path.as_deref().or(input.root.as_deref()));
     if let Err(error) = gate(
@@ -1278,18 +1198,11 @@ fn find(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fa
             }
         }
     }
-    serde_json::to_value(outcome.result).map_err(|error| Failure {
-        code: -32603,
-        message: format!("encode find result: {error}"),
-    })
+    encode(outcome.result, "find result")
 }
 
 fn write(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
-    let input: write::WriteInput =
-        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
-            code: -32602,
-            message: format!("decode write request: {error}"),
-        })?;
+    let input: write::WriteInput = decode(params, "write request")?;
     let scope = shared
         .proj
         .scope(input.task_id.as_deref())
@@ -1315,20 +1228,14 @@ fn write(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, F
     ) {
         return Ok(gated("write", error));
     }
-    serde_json::to_value(shared.reads.write(&scope, &path, input.content)).map_err(|error| {
-        Failure {
-            code: -32603,
-            message: format!("encode write result: {error}"),
-        }
-    })
+    encode(
+        shared.reads.write(&scope, &path, input.content),
+        "write result",
+    )
 }
 
 fn edit(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
-    let input: write::EditInput =
-        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
-            code: -32602,
-            message: format!("decode edit request: {error}"),
-        })?;
+    let input: write::EditInput = decode(params, "edit request")?;
     let scope = shared
         .proj
         .scope(input.task_id.as_deref())
@@ -1360,26 +1267,21 @@ fn edit(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fa
     ) {
         return Ok(gated("edit", error));
     }
-    serde_json::to_value(shared.reads.edit(
-        &scope,
-        key,
-        &path,
-        &input.target,
-        &input.replacement,
-        input.all,
-    ))
-    .map_err(|error| Failure {
-        code: -32603,
-        message: format!("encode edit result: {error}"),
-    })
+    encode(
+        shared.reads.edit(
+            &scope,
+            key,
+            &path,
+            &input.target,
+            &input.replacement,
+            input.all,
+        ),
+        "edit result",
+    )
 }
 
 fn shell(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
-    let mut input: shell::Input =
-        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
-            code: -32602,
-            message: format!("decode shell request: {error}"),
-        })?;
+    let mut input: shell::Input = decode(params, "shell request")?;
     let scope = shared
         .proj
         .scope(input.task_id.as_deref())
@@ -1409,10 +1311,7 @@ fn shell(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, F
         return Ok(gated("shell", error));
     }
     input.cwd = Some(cwd);
-    serde_json::to_value(shared.shells.run(&scope, input)).map_err(|error| Failure {
-        code: -32603,
-        message: format!("encode shell result: {error}"),
-    })
+    encode(shared.shells.run(&scope, input), "shell result")
 }
 
 fn gated(kind: &str, error: GateFailure) -> Value {
@@ -1427,34 +1326,36 @@ fn gated(kind: &str, error: GateFailure) -> Value {
 }
 
 fn cancel_shell(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
-    let input: shell::Cancel =
-        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
-            code: -32602,
-            message: format!("decode shell cancellation: {error}"),
-        })?;
+    let input: shell::Cancel = decode(params, "shell cancellation")?;
     let cancelled = shared.shells.cancel(input).map_err(tool_failure)?;
     Ok(serde_json::json!({"cancelled": cancelled}))
 }
 
 fn tool_failure(error: find::Failure) -> Failure {
-    Failure {
-        code: -32602,
-        message: error.message,
-    }
+    invalid_failure(error.message)
 }
 
-fn internal_failure(error: anyhow::Error) -> Failure {
+fn internal_failure(error: impl std::fmt::Display) -> Failure {
     Failure {
         code: -32603,
         message: error.to_string(),
     }
 }
 
-fn invalid_failure(error: anyhow::Error) -> Failure {
+fn invalid_failure(error: impl std::fmt::Display) -> Failure {
     Failure {
         code: -32602,
         message: error.to_string(),
     }
+}
+
+fn decode<T: DeserializeOwned>(params: Option<Value>, what: &str) -> Result<T, Failure> {
+    serde_json::from_value(params.unwrap_or(Value::Null))
+        .map_err(|error| invalid_failure(format!("decode {what}: {error}")))
+}
+
+fn encode(value: impl Serialize, what: &str) -> Result<Value, Failure> {
+    serde_json::to_value(value).map_err(|error| internal_failure(format!("encode {what}: {error}")))
 }
 
 fn send_notice<T: for<'de> Deserialize<'de>>(
@@ -1471,29 +1372,21 @@ fn send_notice<T: for<'de> Deserialize<'de>>(
         .map(map)
         .map_err(|error| format!("decode turn notification: {error}"));
     let failed = notice.as_ref().err().cloned();
-    let notices = shared.notices.lock().map_err(|_| Failure {
-        code: -32603,
-        message: "rpc notice lock poisoned".into(),
-    })?;
+    let closed = internal_failure("turn notification receiver is closed");
+    let notices = shared
+        .notices
+        .lock()
+        .map_err(|_| internal_failure("rpc notice lock poisoned"))?;
     if notices
         .as_ref()
-        .ok_or_else(|| Failure {
-            code: -32603,
-            message: "turn notification receiver is closed".into(),
-        })?
+        .ok_or(closed)?
         .send(Stamped { order, notice })
         .is_err()
     {
-        return Err(Failure {
-            code: -32603,
-            message: "turn notification receiver is closed".into(),
-        });
+        return Err(internal_failure("turn notification receiver is closed"));
     }
     match failed {
-        Some(message) => Err(Failure {
-            code: -32602,
-            message,
-        }),
+        Some(message) => Err(invalid_failure(message)),
         None => Ok(Value::Null),
     }
 }
