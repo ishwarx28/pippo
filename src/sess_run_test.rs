@@ -129,6 +129,40 @@ fn persists_transitions_and_interrupts_running_runs_on_reopen() {
 }
 
 #[test]
+fn persists_blocked_report_before_versioned_resume() {
+    let root = root();
+    let runs = Runs::open(root.clone()).unwrap();
+    let run = runs.create(input(None)).unwrap();
+    let blocked = runs
+        .update(
+            &run.id,
+            RunStatus::Blocked,
+            1,
+            Some("useful partial".into()),
+        )
+        .unwrap();
+    assert_eq!(blocked.status, RunStatus::Blocked);
+    assert!(runs.update(&run.id, RunStatus::Running, 1, None).is_err());
+    runs.update(&run.id, RunStatus::Running, 2, None).unwrap();
+    let done = runs
+        .update(&run.id, RunStatus::Done, 2, Some("complete".into()))
+        .unwrap();
+    assert_eq!(done.attempt, 2);
+    assert_eq!(
+        fs::read_to_string(
+            root.join("projects/pippo_123abc/reports/t_1234abcd/inspect_project.md")
+        )
+        .unwrap(),
+        "useful partial"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(done.report_path.unwrap())).unwrap(),
+        "complete"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn resolves_only_registered_report_versions_in_stable_order() {
     let root = root();
     let runs = Runs::open(root.clone()).unwrap();

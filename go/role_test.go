@@ -46,6 +46,16 @@ func TestRoleDefaultsAreExact(t *testing.T) {
 	if _, exposed := roles["curator"]; exposed {
 		t.Fatal("curator was exposed as a spawnable role")
 	}
+	for _, name := range []string{explorerRole, workerRole} {
+		if !strings.Contains(roles[name].Prompt, blockedOpen) {
+			t.Fatalf("%s lacks the blocked protocol", name)
+		}
+	}
+	for _, name := range []string{orchestratorRole, plannerRole} {
+		if strings.Contains(roles[name].Prompt, blockedOpen) || !strings.Contains(roles[name].Prompt, "together") {
+			t.Fatalf("%s blocked guidance = %q", name, roles[name].Prompt)
+		}
+	}
 }
 
 func TestPresetAllInheritanceAndRoleOverride(t *testing.T) {

@@ -3,8 +3,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"sync"
@@ -19,6 +21,7 @@ type runStatus string
 const (
 	runRunning     runStatus = "running"
 	runPaused      runStatus = "paused"
+	runBlocked     runStatus = "blocked"
 	runDone        runStatus = "done"
 	runFailed      runStatus = "failed"
 	runStopped     runStatus = "stopped"
@@ -339,21 +342,34 @@ func (s *runSet) resume(ctx context.Context, parent string, args subagentArgs) (
 		s.mu.Unlock()
 		return runOutput{}, fmt.Errorf("run %s is already running", args.ID)
 	}
+	blocked := run.meta.Status == runBlocked
+	if blocked {
+		if err := checkAnswers(run.questions, args.Answers); err != nil {
+			s.mu.Unlock()
+			return runOutput{}, err
+		}
+	} else if len(args.Answers) != 0 {
+		s.mu.Unlock()
+		return runOutput{}, errors.New("answers are only accepted for a blocked run")
+	}
 	if s.activeLocked() >= s.maxParallel {
 		s.mu.Unlock()
 		return runOutput{}, errors.New("parallel subagent limit reached")
 	}
+	restart := blocked || terminal(run.meta.Status)
 	attempt := run.meta.Attempt
 	history := append([]model.Message(nil), run.request.History...)
 	if run.report != "" {
 		history = append(history, model.Message{Role: "model", Text: run.report})
 	}
-	if terminal(run.meta.Status) {
+	if restart {
 		attempt++
-		run.budget = steps{max: run.role.Steps}
 	}
-	if note := resumeNote(args.Answers, args.Amend); note != "" {
-		history = append(history, model.Message{Role: "user", Text: note})
+	if blocked {
+		history = append(history, model.Message{Role: "user", Text: answerNote(run.questions, args.Answers)})
+	}
+	if amend := strings.TrimSpace(args.Amend); amend != "" {
+		history = append(history, model.Message{Role: "user", Text: amend})
 	}
 	if _, err := s.persistLocked(ctx, run, runRunning, attempt, ""); err != nil {
 		s.mu.Unlock()
@@ -361,6 +377,10 @@ func (s *runSet) resume(ctx context.Context, parent string, args subagentArgs) (
 	}
 	run.request.History = history
 	run.meta.Status, run.meta.Attempt, run.report = runRunning, attempt, ""
+	run.questions = nil
+	if restart {
+		run.budget = steps{max: run.role.Steps}
+	}
 	s.startLocked(run)
 	result := output(run)
 	s.mu.Unlock()
@@ -425,7 +445,7 @@ func (s *runSet) wait(ctx context.Context, parent string, ids []string) ([]runOu
 				return nil, err
 			}
 			outputs = append(outputs, output(run))
-			all = all && terminal(run.meta.Status)
+			all = all && settled(run.meta.Status)
 		}
 		changed := s.changed
 		s.mu.Unlock()
@@ -480,6 +500,14 @@ func (s *runSet) execute(ctx context.Context, id string, epoch uint64) {
 		return
 	}
 	status := runDone
+	questions := []string(nil)
+	if err == nil {
+		var blocked bool
+		run.report, questions, blocked, err = blockedReport(run.report, run.role.Name)
+		if blocked {
+			status = runBlocked
+		}
+	}
 	if err != nil {
 		status = runFailed
 		if run.report == "" {
@@ -490,11 +518,13 @@ func (s *runSet) execute(ctx context.Context, id string, epoch uint64) {
 		context.Background(), run, status, run.meta.Attempt, run.report,
 	); persist != nil {
 		status = runFailed
+		questions = nil
 		run.report = strings.TrimSpace(run.report + "\n" + persist.Error())
 	} else if saved.ReportPath != "" {
 		run.report = strings.TrimSpace(run.report) +
 			"\n\nThis same report is written at " + saved.ReportPath
 	}
+	run.questions = questions
 	run.meta.Status = status
 	s.signalLocked()
 }
@@ -624,7 +654,7 @@ func (s *runSet) live() []liveRun {
 	defer s.mu.Unlock()
 	result := make([]liveRun, 0)
 	for _, run := range s.runs {
-		if run.meta.Status == runRunning || run.meta.Status == runPaused {
+		if run.meta.Status == runRunning || run.meta.Status == runPaused || run.meta.Status == runBlocked {
 			result = append(result, liveRun{
 				ID: run.meta.ID, Role: run.meta.Role, Title: run.meta.Title,
 				Status: run.meta.Status, Order: run.order,
@@ -666,17 +696,90 @@ func terminal(status runStatus) bool {
 	return status == runDone || status == runFailed || status == runStopped || status == runInterrupted
 }
 
-func resumeNote(answers []string, amend string) string {
-	parts := make([]string, 0, len(answers)+1)
-	for _, answer := range answers {
-		if answer = strings.TrimSpace(answer); answer != "" {
-			parts = append(parts, answer)
+func settled(status runStatus) bool { return status == runBlocked || terminal(status) }
+
+const blockedOpen, blockedClose = "<pippo-blocked>", "</pippo-blocked>"
+
+func blockedReport(text, role string) (string, []string, bool, error) {
+	report := strings.TrimSpace(text)
+	if role != explorerRole && role != workerRole {
+		return report, nil, false, nil
+	}
+	if !strings.Contains(report, blockedOpen) && !strings.Contains(report, blockedClose) {
+		return report, nil, false, nil
+	}
+	cut := len(report)
+	for _, marker := range []string{blockedOpen, blockedClose} {
+		if index := strings.Index(report, marker); index >= 0 && index < cut {
+			cut = index
 		}
 	}
-	if amend = strings.TrimSpace(amend); amend != "" {
-		parts = append(parts, amend)
+	partial := strings.TrimSpace(report[:cut])
+	protocolStart := "\n" + blockedOpen + "\n"
+	start := strings.LastIndex(report, protocolStart)
+	end := "\n" + blockedClose
+	if start < 0 || strings.Count(report, blockedOpen) != 1 || strings.Count(report, blockedClose) != 1 ||
+		!strings.HasSuffix(report, end) {
+		return partial, nil, false, errors.New("invalid blocked report protocol")
 	}
-	return strings.Join(parts, "\n")
+	start += len(protocolStart)
+	var payload struct {
+		Questions []string `json:"questions"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(report[start : len(report)-len(end)]))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return partial, nil, false, fmt.Errorf("invalid blocked questions: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return partial, nil, false, errors.New("invalid blocked questions: trailing data")
+	}
+	if partial == "" {
+		return "", nil, false, errors.New("blocked report has no useful partial report")
+	}
+	if err := checkQuestions(payload.Questions); err != nil {
+		return partial, nil, false, err
+	}
+	return partial, payload.Questions, true, nil
+}
+
+func checkQuestions(questions []string) error {
+	if len(questions) == 0 || len(questions) > 4 {
+		return errors.New("blocked report requires one to four questions")
+	}
+	seen := make(map[string]bool, len(questions))
+	for index, question := range questions {
+		questions[index] = strings.TrimSpace(question)
+		key := strings.ToLower(questions[index])
+		if err := checkClarify(clarifyArgs{Question: questions[index]}); err != nil || seen[key] {
+			return errors.New("blocked questions must be plain, non-empty and distinct")
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
+func checkAnswers(questions, answers []string) error {
+	if len(answers) != len(questions) {
+		return fmt.Errorf("blocked run requires %d answers in question order", len(questions))
+	}
+	for _, answer := range answers {
+		if strings.TrimSpace(answer) == "" {
+			return errors.New("blocked run answers must be non-empty")
+		}
+	}
+	return nil
+}
+
+func answerNote(questions, answers []string) string {
+	var text strings.Builder
+	text.WriteString("Answers to blocked questions:")
+	for index := range questions {
+		fmt.Fprintf(&text, "\n%d. Question: %s\n   Answer: %s", index+1, questions[index],
+			strings.TrimSpace(answers[index]))
+	}
+	return text.String()
 }
 
 func runQuery(meta runMeta) string {

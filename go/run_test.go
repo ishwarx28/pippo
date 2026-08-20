@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http/httptest"
 	"reflect"
@@ -51,13 +52,14 @@ func (p *controlledProvider) Stream(
 }
 
 type runtimeRuns struct {
-	mu      sync.Mutex
-	next    int
-	finds   int
-	entries map[string]runMeta
-	creates []runCreate
-	reports map[string][]string
-	refs    []runReport
+	mu         sync.Mutex
+	next       int
+	finds      int
+	failResume bool
+	entries    map[string]runMeta
+	creates    []runCreate
+	reports    map[string][]string
+	refs       []runReport
 }
 
 func (r *runtimeRuns) create(_ context.Context, _ *rpc, raw json.RawMessage) (any, error) {
@@ -91,6 +93,9 @@ func (r *runtimeRuns) update(_ context.Context, _ *rpc, raw json.RawMessage) (an
 	meta, ok := r.entries[input.ID]
 	if !ok {
 		return nil, fmt.Errorf("unknown run %s", input.ID)
+	}
+	if r.failResume && meta.Status == runBlocked && input.Status == runRunning {
+		return nil, errors.New("resume persistence failed")
 	}
 	meta.Status, meta.Attempt = input.Status, input.Attempt
 	if input.Report != "" {
@@ -194,7 +199,7 @@ func TestSubagentPauseResumeWaitAndReportVersions(t *testing.T) {
 		t.Fatalf("wait = %#v", done)
 	}
 	if _, err := runs.act(context.Background(), peer, "orchestrator", "", "", subagentArgs{
-		Action: "resume", ID: id, Answers: []string{"Use exponential backoff."},
+		Action: "resume", ID: id, Amend: "Use exponential backoff.",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -426,6 +431,28 @@ func TestSubagentToolExecutesARealManagedRun(t *testing.T) {
 	}
 }
 
+func TestSubagentToolReturnsBlockedQuestionsInOneResult(t *testing.T) {
+	provider := &controlledProvider{started: make(chan runAttempt, 2)}
+	runs, peer, _ := runHarness(t, provider)
+	result := make(chan model.Result, 1)
+	go func() {
+		result <- execTool(context.Background(), peer, runs, orchestratorRole,
+			callID{Turn: "turn-blocked", Request: "request-blocked"}, "", model.Call{
+				ID: "subagent-blocked", Name: "subagent", Args: map[string]any{
+					"action": "spawn", "role": "explorer", "task_id": "t_1234abcd",
+					"title": "inspect retry policy", "request": "Inspect the retry policy.", "wait": true,
+				},
+			})
+	}()
+	receive(t, provider.started).release <- blockedText("Partial evidence.", "Which branch?", "Which client?")
+	got := receive(t, result)
+	output, ok := got.Data["output"].(runOutput)
+	if !ok || output.Status != runBlocked ||
+		!reflect.DeepEqual(output.Questions, []string{"Which branch?", "Which client?"}) {
+		t.Fatalf("blocked tool result = %#v", got)
+	}
+}
+
 func TestSubagentPauseStopRaceSettlesOnce(t *testing.T) {
 	provider := &controlledProvider{started: make(chan runAttempt, 2)}
 	runs, peer, _ := runHarness(t, provider)
@@ -474,4 +501,215 @@ func TestSubagentRejectsInvalidActionShapes(t *testing.T) {
 	if err := checkSpawn("planner", "t_1234abcd", spawnArgs("planner")); err == nil {
 		t.Fatal("planner spawned a planner")
 	}
+}
+
+func TestBlockedReportProtocolIsTerminalStrictAndControlFree(t *testing.T) {
+	normal := "Normal evidence with a JSON example."
+	if report, questions, blocked, err := blockedReport(normal, explorerRole); err != nil || blocked || report != normal || len(questions) != 0 {
+		t.Fatalf("normal report = %q, %#v, %v, %v", report, questions, blocked, err)
+	}
+	for _, count := range []int{1, 4} {
+		questions := make([]string, count)
+		for index := range questions {
+			questions[index] = fmt.Sprintf("Question %d?", index+1)
+		}
+		text := blockedText("Useful partial report.", questions...)
+		report, got, blocked, err := blockedReport(text, workerRole)
+		if err != nil || !blocked || report != "Useful partial report." || !reflect.DeepEqual(got, questions) ||
+			strings.Contains(report, "pippo-blocked") {
+			t.Fatalf("valid batch %d = %q, %#v, %v, %v", count, report, got, blocked, err)
+		}
+	}
+	valid := blockedText("Partial.", "Which target?")
+	if report, _, blocked, err := blockedReport(valid, plannerRole); err != nil || blocked || report != valid {
+		t.Fatalf("planner report was parsed: %q, %v, %v", report, blocked, err)
+	}
+}
+
+func TestBlockedReportRejectsInvalidBatches(t *testing.T) {
+	tests := []string{
+		blockedText("Partial."),
+		blockedText("Partial.", "Same?", " same? "),
+		blockedText("Partial.", "One?", "Two?", "Three?", "Four?", "Five?"),
+		blockedText("Partial.", ""),
+		"Partial.\n\n" + blockedOpen + "\n{bad json}\n" + blockedClose,
+		"Partial.\n\n" + blockedOpen + "\n{\"questions\":[\"One?\"],\"extra\":true}\n" + blockedClose,
+		"Partial.\n\n" + blockedOpen + "\n{\"questions\":[\"One?\"]}\n" + blockedClose + " trailing",
+		"Partial. " + blockedOpen + " malformed " + blockedClose,
+	}
+	for _, text := range tests {
+		report, questions, blocked, err := blockedReport(text, explorerRole)
+		if err == nil || blocked || len(questions) != 0 || strings.Contains(report, "pippo-blocked") {
+			t.Fatalf("accepted invalid protocol: %q => %q, %#v, %v, %v", text, report, questions, blocked, err)
+		}
+	}
+}
+
+func TestBlockedRunWaitsAndResumesWithCorrelatedAnswers(t *testing.T) {
+	provider := &controlledProvider{started: make(chan runAttempt, 4)}
+	runs, peer, runtime := runHarness(t, provider)
+	created, err := runs.act(context.Background(), peer, orchestratorRole, "", "", spawnArgs(workerRole))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := created.(runOutput).ID
+	first := receive(t, provider.started)
+	questions := []string{"Which retry policy?", "What timeout?"}
+	first.release <- blockedText("I traced the call path and stopped before editing.", questions...)
+	waitResult, err := runs.act(context.Background(), peer, orchestratorRole, "", "", subagentArgs{
+		Action: "wait", IDs: []string{id},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waited := waitResult.(map[string]any)["runs"].([]runOutput)
+	if waited[0].Status != runBlocked || !reflect.DeepEqual(waited[0].Questions, questions) ||
+		strings.Contains(waited[0].Report, "pippo-blocked") {
+		t.Fatalf("blocked wait = %#v, %v", waited, err)
+	}
+	for _, answers := range [][]string{nil, {"exponential"}, {"exponential", " "}} {
+		if _, err := runs.resume(context.Background(), "", subagentArgs{
+			Action: "resume", ID: id, Answers: answers,
+		}); err == nil {
+			t.Fatalf("accepted mismatched answers %#v", answers)
+		}
+	}
+	resumed, err := runs.resume(context.Background(), "", subagentArgs{
+		Action: "resume", ID: id, Answers: []string{"Exponential backoff", "Thirty seconds"},
+		Amend: "Keep the public API unchanged.",
+	})
+	if err != nil || resumed.Status != runRunning || len(resumed.Questions) != 0 {
+		t.Fatalf("resume = %#v, %v", resumed, err)
+	}
+	second := receive(t, provider.started)
+	if len(second.request.History) != 3 || !strings.Contains(second.request.History[0].Text, "stopped before editing") ||
+		second.request.History[1].Text != "Answers to blocked questions:\n1. Question: Which retry policy?\n   Answer: Exponential backoff\n2. Question: What timeout?\n   Answer: Thirty seconds" ||
+		second.request.History[2].Text != "Keep the public API unchanged." {
+		t.Fatalf("resumed history = %#v", second.request.History)
+	}
+	second.release <- "Implemented and verified."
+	done, err := runs.wait(context.Background(), "", []string{id})
+	if err != nil || done[0].Status != runDone || len(done[0].Questions) != 0 {
+		t.Fatalf("completed run = %#v, %v", done, err)
+	}
+	runtime.mu.Lock()
+	meta, reports := runtime.entries[id], append([]string(nil), runtime.reports[id]...)
+	runtime.mu.Unlock()
+	if meta.Attempt != 2 || len(reports) != 2 || reports[0] != "I traced the call path and stopped before editing." ||
+		reports[1] != "Implemented and verified." {
+		t.Fatalf("durable versions = %#v, %#v", meta, reports)
+	}
+}
+
+func TestBlockedRunRetainsQuestionsWhenResumePersistenceFails(t *testing.T) {
+	provider := &controlledProvider{started: make(chan runAttempt, 2)}
+	runs, peer, runtime := runHarness(t, provider)
+	created, _ := runs.act(context.Background(), peer, orchestratorRole, "", "", spawnArgs(explorerRole))
+	id := created.(runOutput).ID
+	receive(t, provider.started).release <- blockedText("Partial evidence.", "Which branch?")
+	if _, err := runs.wait(context.Background(), "", []string{id}); err != nil {
+		t.Fatal(err)
+	}
+	runtime.mu.Lock()
+	runtime.failResume = true
+	runtime.mu.Unlock()
+	if _, err := runs.resume(context.Background(), "", subagentArgs{
+		Action: "resume", ID: id, Answers: []string{"main"},
+	}); err == nil {
+		t.Fatal("resume succeeded despite persistence failure")
+	}
+	waited, err := runs.wait(context.Background(), "", []string{id})
+	if err != nil || waited[0].Status != runBlocked ||
+		!reflect.DeepEqual(waited[0].Questions, []string{"Which branch?"}) {
+		t.Fatalf("retained blocked state = %#v, %v", waited, err)
+	}
+}
+
+func TestMalformedBlockedControlNeverReachesSavedReport(t *testing.T) {
+	provider := &controlledProvider{started: make(chan runAttempt, 2)}
+	runs, peer, runtime := runHarness(t, provider)
+	created, err := runs.act(context.Background(), peer, orchestratorRole, "", "", spawnArgs(workerRole))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := created.(runOutput).ID
+	receive(t, provider.started).release <- "Useful partial.\n\n" + blockedOpen + "\n{bad}\n" + blockedClose
+	waited, err := runs.wait(context.Background(), "", []string{id})
+	if err != nil || waited[0].Status != runFailed || strings.Contains(waited[0].Report, "pippo-blocked") {
+		t.Fatalf("malformed output = %#v, %v", waited, err)
+	}
+	runtime.mu.Lock()
+	saved := append([]string(nil), runtime.reports[id]...)
+	runtime.mu.Unlock()
+	if len(saved) != 1 || saved[0] != "Useful partial." {
+		t.Fatalf("saved malformed report = %#v", saved)
+	}
+}
+
+func TestBlockedChildIsVisibleOnlyToItsPlanner(t *testing.T) {
+	provider := &controlledProvider{started: make(chan runAttempt, 4)}
+	runs, peer, _ := runHarness(t, provider)
+	parentAny, err := runs.act(context.Background(), peer, orchestratorRole, "", "", spawnArgs(plannerRole))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := parentAny.(runOutput).ID
+	receive(t, provider.started)
+	childAny, err := runs.act(context.Background(), peer, plannerRole, parent, "t_1234abcd", spawnArgs(workerRole))
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := childAny.(runOutput).ID
+	receive(t, provider.started).release <- blockedText("Partial child work.", "Approve option A?")
+	waited, err := runs.wait(context.Background(), parent, []string{child})
+	if err != nil || waited[0].Status != runBlocked || len(waited[0].Questions) != 1 {
+		t.Fatalf("planner wait = %#v, %v", waited, err)
+	}
+	if _, err := runs.wait(context.Background(), "", []string{child}); err == nil {
+		t.Fatal("orchestrator observed a planner-owned blocked child")
+	}
+	if _, err := runs.resume(context.Background(), "", subagentArgs{
+		Action: "resume", ID: child, Answers: []string{"yes"},
+	}); err == nil {
+		t.Fatal("orchestrator answered a planner-owned blocked child")
+	}
+	if _, err := runs.stop(context.Background(), "", parent); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBlockedRunPauseStopAndShutdownSettle(t *testing.T) {
+	provider := &controlledProvider{started: make(chan runAttempt, 4)}
+	runs, peer, _ := runHarness(t, provider)
+	created, _ := runs.act(context.Background(), peer, orchestratorRole, "", "", spawnArgs(workerRole))
+	id := created.(runOutput).ID
+	receive(t, provider.started).release <- blockedText("Partial work.", "Continue?")
+	if _, err := runs.wait(context.Background(), "", []string{id}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runs.pause(context.Background(), "", id); err == nil {
+		t.Fatal("blocked run was paused")
+	}
+	stopped, err := runs.stop(context.Background(), "", id)
+	if err != nil || stopped.Status != runStopped || !reflect.DeepEqual(stopped.Questions, []string{"Continue?"}) {
+		t.Fatalf("blocked stop = %#v, %v", stopped, err)
+	}
+
+	second, _ := runs.act(context.Background(), peer, orchestratorRole, "", "", spawnArgs(explorerRole))
+	secondID := second.(runOutput).ID
+	receive(t, provider.started).release <- blockedText("Partial evidence.", "Which path?")
+	if _, err := runs.wait(context.Background(), "", []string{secondID}); err != nil {
+		t.Fatal(err)
+	}
+	runs.shutdown()
+	interrupted, err := runs.wait(context.Background(), "", []string{secondID})
+	if err != nil || interrupted[0].Status != runInterrupted ||
+		!reflect.DeepEqual(interrupted[0].Questions, []string{"Which path?"}) {
+		t.Fatalf("blocked shutdown = %#v, %v", interrupted, err)
+	}
+}
+
+func blockedText(report string, questions ...string) string {
+	payload, _ := json.Marshal(map[string]any{"questions": questions})
+	return report + "\n\n" + blockedOpen + "\n" + string(payload) + "\n" + blockedClose
 }

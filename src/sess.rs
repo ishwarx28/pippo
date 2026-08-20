@@ -16,6 +16,7 @@ use std::{
 pub enum RunStatus {
     Running,
     Paused,
+    Blocked,
     Done,
     Failed,
     Stopped,
@@ -175,16 +176,26 @@ impl Runs {
             .get_mut(id)
             .with_context(|| format!("run {id} is not registered"))?;
         let valid = match (entry.meta.status, status) {
-            (RunStatus::Running, RunStatus::Paused | RunStatus::Done | RunStatus::Failed)
+            (
+                RunStatus::Running,
+                RunStatus::Paused | RunStatus::Blocked | RunStatus::Done | RunStatus::Failed,
+            )
             | (RunStatus::Running, RunStatus::Stopped | RunStatus::Interrupted)
             | (
                 RunStatus::Paused,
                 RunStatus::Running | RunStatus::Stopped | RunStatus::Interrupted,
             ) => attempt == entry.meta.attempt,
             (
-                RunStatus::Done | RunStatus::Failed | RunStatus::Stopped | RunStatus::Interrupted,
+                RunStatus::Blocked
+                | RunStatus::Done
+                | RunStatus::Failed
+                | RunStatus::Stopped
+                | RunStatus::Interrupted,
                 RunStatus::Running,
             ) => attempt == entry.meta.attempt + 1,
+            (RunStatus::Blocked, RunStatus::Stopped | RunStatus::Interrupted) => {
+                attempt == entry.meta.attempt
+            }
             _ => false,
         };
         if !valid {

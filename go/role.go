@@ -19,6 +19,12 @@ const (
 	workerRole       = "worker"
 )
 
+const blockedInstruction = ` If genuinely blocked, first write a complete useful partial report, then end it with this block on its own lines:
+<pippo-blocked>
+{"questions":["First plain question?"]}
+</pippo-blocked>
+Include one to four distinct single-line questions. Never emit this block for a normal report.`
+
 type role struct {
 	Name        string
 	Prompt      string
@@ -82,16 +88,16 @@ func roleDefaults(input limits) map[string]role {
 	return map[string]role{
 		orchestratorRole: {Name: orchestratorRole, Model: "gemini-3.7-flash", Reasoning: model.ReasoningHigh,
 			Steps: steps[0], Tools: []model.Tool{taskTool, subagentTool, clarifyTool},
-			Prompt: "You are the orchestrator. Be collaborative and terse. Delegate concrete work, ask only outcome-changing questions, distinguish facts from uncertainty, and never use project tools directly."},
+			Prompt: "You are the orchestrator. Be collaborative and terse. Delegate concrete work, ask only outcome-changing questions, distinguish facts from uncertainty, and never use project tools directly. When a run returns blocked questions, ask them together in one clarification and resume with answers in the same order."},
 		plannerRole: {Name: plannerRole, Model: "gemini-3.7-flash", Reasoning: model.ReasoningHigh,
 			Steps: steps[1], Tools: []model.Tool{subagentTool, clarifyTool, planTool},
-			Prompt: "You are the planner. Produce ordered steps with owners, checks, and named risks. Clarify only outcome-changing ambiguity, delegate investigation when useful, and sign off with an executable plan."},
+			Prompt: "You are the planner. Produce ordered steps with owners, checks, and named risks. Clarify only outcome-changing ambiguity, delegate investigation when useful, and sign off with an executable plan. Ask a run's blocked questions together and resume with answers in the same order."},
 		explorerRole: {Name: explorerRole, Model: "gemini-3.5-flash", Reasoning: model.ReasoningLow,
 			Steps: steps[2], Tools: []model.Tool{findTool, shellTool},
-			Prompt: "You are the explorer. Investigate read-only, cite every finding as path:line, never speculate, and return a concise evidence report. You cannot ask the user."},
+			Prompt: "You are the explorer. Investigate read-only, cite every finding as path:line, never speculate, and return a concise evidence report. You cannot ask the user." + blockedInstruction},
 		workerRole: {Name: workerRole, Model: "gemini-3.5-flash", Reasoning: model.ReasoningLow,
 			Steps: steps[3], Tools: []model.Tool{findTool, shellTool, writeTool, editTool},
-			Prompt: "You are the worker. Make surgical changes, verify with the project's own build and tests, report partial success honestly, and never ask the user."},
+			Prompt: "You are the worker. Make surgical changes, verify with the project's own build and tests, report partial success honestly, and never ask the user." + blockedInstruction},
 	}
 }
 
