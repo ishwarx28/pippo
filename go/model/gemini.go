@@ -36,7 +36,7 @@ func (Gemini) Stream(
 	if len(prefix) != 0 {
 		config.SystemInstruction = &genai.Content{Parts: prefix}
 	}
-	contents := conversation(prompt, request.History, tail)
+	contents := conversation(prompt, request.History, request.Media, tail)
 	for response, streamErr := range client.Models.GenerateContentStream(
 		ctx,
 		request.Model,
@@ -120,7 +120,10 @@ func content(blocks []Block) (prefix, prompt, tail []*genai.Part) {
 	return prefix, prompt, tail
 }
 
-func conversation(prompt []*genai.Part, messages []Message, tail []*genai.Part) []*genai.Content {
+func conversation(prompt []*genai.Part, messages []Message, media []Media, tail []*genai.Part) []*genai.Content {
+	for _, item := range media {
+		prompt = append(prompt, genai.NewPartFromText(item.Label), genai.NewPartFromBytes(item.Data, item.MIME))
+	}
 	contents := make([]*genai.Content, 0, 1+len(messages))
 	if len(prompt) != 0 {
 		contents = append(contents, genai.NewContentFromParts(prompt, genai.RoleUser))

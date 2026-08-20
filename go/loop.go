@@ -37,9 +37,10 @@ type callID struct {
 
 type startRequest struct {
 	callID
-	Query      string `json:"query"`
-	Transcript string `json:"transcript,omitempty"`
-	Model      string `json:"model,omitempty"`
+	Query       string       `json:"query"`
+	Transcript  string       `json:"transcript,omitempty"`
+	Model       string       `json:"model,omitempty"`
+	Attachments []mediaInput `json:"attachments,omitempty"`
 }
 
 type accepted struct {
@@ -166,10 +167,16 @@ func startTurn(state *state) handler {
 			Query:             input.Query,
 		})
 		request.Tools = tools
+		media, err := prepareMedia(input.Attachments)
+		if err != nil {
+			return nil, err
+		}
+		request.Media = visibleMedia(media)
 		runCtx, ok := state.loop.start(ctx, input.callID)
 		if !ok {
 			return nil, errors.New("model request is already running")
 		}
+		state.loop.agents.attach(input.callID, media)
 		go state.loop.stream(runCtx, peer, input.callID, request)
 		return accepted{callID: input.callID, Accepted: true}, nil
 	}
@@ -190,6 +197,7 @@ func cancelTurn(state *state) handler {
 
 func (l *loop) stream(ctx context.Context, peer *rpc, id callID, request model.Request) {
 	defer l.finish(id)
+	defer l.agents.release(id)
 	status, detail := "done", ""
 	var secret struct {
 		Value string `json:"value"`

@@ -176,6 +176,7 @@ type subagentArgs struct {
 	IDs         []string `json:"ids,omitempty"`
 	Answers     []string `json:"answers,omitempty"`
 	Amend       string   `json:"amend,omitempty"`
+	origin      callID
 }
 
 type clarifyOption struct {
@@ -313,6 +314,7 @@ func execTool(
 			result.Data = map[string]any{"error": "subagent lifecycle is unavailable"}
 			return result
 		}
+		args.origin = id
 		caller := ""
 		if role == "planner" {
 			caller = id.Turn
@@ -548,6 +550,9 @@ func checkSpawn(callerRole, callerTask string, args subagentArgs) error {
 	if args.TaskID == "" {
 		if callerRole != "orchestrator" || args.Role != "explorer" {
 			return errors.New("only an orchestrator scout explorer may omit the task")
+		}
+		if len(args.Related) != 0 || len(args.Highlight) != 0 {
+			return errors.New("a scout cannot receive reports")
 		}
 	} else if len(args.TaskID) != 10 || !strings.HasPrefix(args.TaskID, "t_") {
 		return errors.New("spawn task id is invalid")

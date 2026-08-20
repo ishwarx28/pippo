@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -55,6 +56,7 @@ type runtimeRuns struct {
 	entries map[string]runMeta
 	creates []runCreate
 	reports map[string][]string
+	refs    []runReport
 }
 
 func (r *runtimeRuns) create(_ context.Context, _ *rpc, raw json.RawMessage) (any, error) {
@@ -71,6 +73,7 @@ func (r *runtimeRuns) create(_ context.Context, _ *rpc, raw json.RawMessage) (an
 		Role: input.Role, Title: input.Title, Request: input.Request, Status: runRunning,
 		Attempt: 1, Constraints: input.Constraints, Media: input.Media,
 		Related: input.Related, Highlight: input.Highlight,
+		Reports: append([]runReport(nil), r.refs...),
 	}
 	r.entries[id] = meta
 	r.creates = append(r.creates, input)
@@ -206,6 +209,98 @@ func TestSubagentPauseResumeWaitAndReportVersions(t *testing.T) {
 		t.Fatalf("report versions = %#v", runtime.reports[id])
 	}
 	_ = first
+}
+
+func TestSubagentAssemblesPathsWithoutReportContents(t *testing.T) {
+	provider := &controlledProvider{started: make(chan runAttempt, 2)}
+	runs, peer, runtime := runHarness(t, provider)
+	runtime.refs = []runReport{
+		{Path: "projects/pippo_123abc/reports/t_old/old_(1).md", Central: true},
+		{Path: "projects/pippo_123abc/reports/t_old/latest.md"},
+	}
+	args := spawnArgs("explorer")
+	args.Request = "Trace the retry flow."
+	args.Constraints = []string{"Read only", "Cite exact lines"}
+	if _, err := runs.act(context.Background(), peer, "orchestrator", "", "", args); err != nil {
+		t.Fatal(err)
+	}
+	attempt := receive(t, provider.started)
+	want := "<request>\nTrace the retry flow.\n</request>\n<constraints>\n" +
+		"- Read only\n- Cite exact lines\n</constraints>\n<reports>\n" +
+		"- [central] projects/pippo_123abc/reports/t_old/old_(1).md\n" +
+		"- projects/pippo_123abc/reports/t_old/latest.md\n</reports>"
+	if len(attempt.request.Blocks) != 1 || attempt.request.Blocks[0].Kind != model.Query ||
+		attempt.request.Blocks[0].Text != want || strings.Contains(attempt.request.Blocks[0].Text, "report body") {
+		t.Fatalf("assembled request = %#v", attempt.request.Blocks)
+	}
+	attempt.release <- "done"
+}
+
+func TestSubagentMediaSelectionIsolationAndResume(t *testing.T) {
+	provider := &controlledProvider{started: make(chan runAttempt, 8)}
+	runs, peer, _ := runHarness(t, provider)
+	origin := callID{Turn: "turn-media", Request: "request-media"}
+	media, err := prepareMedia([]mediaInput{
+		{MIME: "image/png", Data: []byte{1, 2}},
+		{MIME: "image/jpg", Data: []byte{3, 4}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs.attach(origin, media)
+	args := spawnArgs("planner")
+	args.Media, args.origin = []int{2}, origin
+	created, err := runs.act(context.Background(), peer, "orchestrator", "", "", args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := created.(runOutput).ID
+	first := receive(t, provider.started)
+	if len(first.request.Media) != 1 || first.request.Media[0].Label != "attachment 2 · image/jpeg" ||
+		!reflect.DeepEqual(first.request.Media[0].Data, []byte{3, 4}) ||
+		strings.Contains(first.request.Media[0].Label, "/cache/") {
+		t.Fatalf("selected media = %#v", first.request.Media)
+	}
+	child := spawnArgs("worker")
+	child.Media = []int{1}
+	if _, err := runs.act(context.Background(), peer, "planner", id, args.TaskID, child); err == nil {
+		t.Fatal("planner accessed media it did not receive")
+	}
+	if _, err := runs.act(context.Background(), peer, "orchestrator", "", "", subagentArgs{
+		Action: "pause", ID: id,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runs.act(context.Background(), peer, "orchestrator", "", "", subagentArgs{
+		Action: "resume", ID: id,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second := receive(t, provider.started)
+	if !reflect.DeepEqual(second.request.Blocks, first.request.Blocks) ||
+		!reflect.DeepEqual(second.request.Media, first.request.Media) {
+		t.Fatalf("resumed request changed: %#v", second.request)
+	}
+	second.release <- "done"
+}
+
+func TestMediaValidationRejectsUnsupportedOversizeAndUnavailable(t *testing.T) {
+	if _, err := prepareMedia([]mediaInput{{MIME: "audio/mpeg", Data: []byte{1}}}); err == nil {
+		t.Fatal("audio was accepted")
+	}
+	if _, err := prepareMedia([]mediaInput{{MIME: "image/png", Data: make([]byte, maxMediaBytes+1)}}); err == nil {
+		t.Fatal("oversize media was accepted")
+	}
+	provider := &controlledProvider{started: make(chan runAttempt, 1)}
+	runs, peer, runtime := runHarness(t, provider)
+	args := spawnArgs("worker")
+	args.Media = []int{1}
+	if _, err := runs.act(context.Background(), peer, "orchestrator", "", "", args); err == nil {
+		t.Fatal("missing originating attachment was accepted")
+	}
+	if runtime.next != 0 {
+		t.Fatal("invalid media created a durable run")
+	}
 }
 
 func TestSubagentNestingLimitsOwnershipAndDescendantStop(t *testing.T) {

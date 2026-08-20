@@ -273,6 +273,21 @@ impl Proj {
             .with_context(|| format!("task {id} is not registered"))
     }
 
+    pub fn related(&self, project: &str, ids: &[String]) -> Result<()> {
+        let state = self.lock()?;
+        for id in ids {
+            let task = state
+                .meta
+                .tasks
+                .get(id)
+                .with_context(|| format!("related task {id} is not registered"))?;
+            if task.project_id != project {
+                anyhow::bail!("related task {id} belongs to another project");
+            }
+        }
+        Ok(())
+    }
+
     pub fn live(&self, task_id: Option<&str>) -> Result<Live> {
         let (task, project, projects) = {
             let state = self.lock()?;

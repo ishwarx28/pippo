@@ -12,6 +12,8 @@ import (
 	"pippo/go/model"
 )
 
+const maxMediaBytes = 20 << 20
+
 type runStatus string
 
 const (
@@ -24,20 +26,36 @@ const (
 )
 
 type runMeta struct {
-	ID          string    `json:"id"`
-	ParentID    string    `json:"parent_id,omitempty"`
-	TaskID      string    `json:"task_id,omitempty"`
-	ProjectID   string    `json:"project_id,omitempty"`
-	Role        string    `json:"role"`
-	Title       string    `json:"title"`
-	Request     string    `json:"request"`
-	Status      runStatus `json:"status"`
-	Attempt     int       `json:"attempt"`
-	Constraints []string  `json:"constraints"`
-	Media       []int     `json:"media"`
-	Related     []string  `json:"related"`
-	Highlight   []string  `json:"highlight"`
-	ReportPath  string    `json:"report_path,omitempty"`
+	ID          string      `json:"id"`
+	ParentID    string      `json:"parent_id,omitempty"`
+	TaskID      string      `json:"task_id,omitempty"`
+	ProjectID   string      `json:"project_id,omitempty"`
+	Role        string      `json:"role"`
+	Title       string      `json:"title"`
+	Request     string      `json:"request"`
+	Status      runStatus   `json:"status"`
+	Attempt     int         `json:"attempt"`
+	Constraints []string    `json:"constraints"`
+	Media       []int       `json:"media"`
+	Related     []string    `json:"related"`
+	Highlight   []string    `json:"highlight"`
+	ReportPath  string      `json:"report_path,omitempty"`
+	Reports     []runReport `json:"reports,omitempty"`
+}
+
+type runReport struct {
+	Path    string `json:"path"`
+	Central bool   `json:"central"`
+}
+
+type mediaInput struct {
+	MIME string `json:"mime"`
+	Data []byte `json:"data"`
+}
+
+type numberedMedia struct {
+	number int
+	value  model.Media
 }
 
 type runCreate struct {
@@ -80,12 +98,14 @@ type agentRun struct {
 	settled   chan struct{}
 	active    bool
 	epoch     uint64
+	media     []numberedMedia
 }
 
 type runSet struct {
 	mu          sync.Mutex
 	provider    model.Provider
 	runs        map[string]*agentRun
+	origins     map[callID][]numberedMedia
 	changed     chan struct{}
 	maxParallel int
 	maxDepth    int
@@ -96,9 +116,22 @@ type runSet struct {
 
 func newRunSet(provider model.Provider) *runSet {
 	return &runSet{
-		provider: provider, runs: make(map[string]*agentRun), changed: make(chan struct{}),
+		provider: provider, runs: make(map[string]*agentRun), origins: make(map[callID][]numberedMedia),
+		changed:     make(chan struct{}),
 		maxParallel: 4, maxDepth: 3,
 	}
+}
+
+func (s *runSet) attach(id callID, media []numberedMedia) {
+	s.mu.Lock()
+	s.origins[id] = media
+	s.mu.Unlock()
+}
+
+func (s *runSet) release(id callID) {
+	s.mu.Lock()
+	delete(s.origins, id)
+	s.mu.Unlock()
 }
 
 func (s *runSet) configure(parallel, depth int) {
@@ -168,6 +201,15 @@ func (s *runSet) spawn(
 		}
 		depth = owner.depth + 1
 	}
+	source := s.origins[args.origin]
+	if parent != "" {
+		source = s.runs[parent].media
+	}
+	media, err := selectMedia(source, args.Media)
+	if err != nil {
+		s.mu.Unlock()
+		return runOutput{}, err
+	}
 	if depth > s.maxDepth {
 		s.mu.Unlock()
 		return runOutput{}, errors.New("subagent nesting limit reached")
@@ -177,7 +219,7 @@ func (s *runSet) spawn(
 		return runOutput{}, errors.New("parallel subagent limit reached")
 	}
 	var meta runMeta
-	err := peer.call(context.WithoutCancel(ctx), "runtime.run", runCreate{
+	err = peer.call(context.WithoutCancel(ctx), "runtime.run", runCreate{
 		Action: "create", ParentID: parent, TaskID: args.TaskID, Role: args.Role,
 		Title: args.Title, Request: args.Request, Constraints: args.Constraints,
 		Media: args.Media, Related: args.Related, Highlight: args.Highlight,
@@ -191,8 +233,9 @@ func (s *runSet) spawn(
 		return runOutput{}, errors.New("runtime returned inconsistent run metadata")
 	}
 	run := &agentRun{
-		meta: meta, depth: depth, peer: peer,
-		request: model.Request{Model: defaultModel, Blocks: []model.Block{{Kind: model.Query, Text: args.Request}}},
+		meta: meta, depth: depth, peer: peer, media: media,
+		request: model.Request{Model: defaultModel,
+			Blocks: []model.Block{{Kind: model.Query, Text: runQuery(meta)}}, Media: visibleMedia(media)},
 	}
 	s.next++
 	run.order = s.next
@@ -564,4 +607,72 @@ func resumeNote(answers []string, amend string) string {
 		parts = append(parts, amend)
 	}
 	return strings.Join(parts, "\n")
+}
+
+func runQuery(meta runMeta) string {
+	var text strings.Builder
+	fmt.Fprintf(&text, "<request>\n%s\n</request>\n<constraints>\n", strings.TrimSpace(meta.Request))
+	for _, constraint := range meta.Constraints {
+		fmt.Fprintf(&text, "- %s\n", strings.TrimSpace(constraint))
+	}
+	text.WriteString("</constraints>\n<reports>\n")
+	for _, report := range meta.Reports {
+		if report.Central {
+			fmt.Fprintf(&text, "- [central] %s\n", report.Path)
+		} else {
+			fmt.Fprintf(&text, "- %s\n", report.Path)
+		}
+	}
+	text.WriteString("</reports>")
+	return text.String()
+}
+
+func prepareMedia(input []mediaInput) ([]numberedMedia, error) {
+	allowed := map[string]string{
+		"image/png": "image/png", "image/jpeg": "image/jpeg", "image/jpg": "image/jpeg",
+		"image/webp": "image/webp", "image/gif": "image/gif", "application/pdf": "application/pdf",
+		"text/plain": "text/plain",
+	}
+	result := make([]numberedMedia, 0, len(input))
+	total := 0
+	for index, item := range input {
+		mime := allowed[strings.ToLower(strings.TrimSpace(item.MIME))]
+		if mime == "" || len(item.Data) == 0 {
+			return nil, fmt.Errorf("attachment %d has an unsupported MIME type or no data", index+1)
+		}
+		total += len(item.Data)
+		if total > maxMediaBytes {
+			return nil, fmt.Errorf("attachments exceed the %d byte inline limit", maxMediaBytes)
+		}
+		data := append([]byte(nil), item.Data...)
+		result = append(result, numberedMedia{number: index + 1, value: model.Media{
+			Label: fmt.Sprintf("attachment %d · %s", index+1, mime), MIME: mime, Data: data,
+		}})
+	}
+	return result, nil
+}
+
+func selectMedia(source []numberedMedia, numbers []int) ([]numberedMedia, error) {
+	byNumber := make(map[int]numberedMedia, len(source))
+	for _, item := range source {
+		byNumber[item.number] = item
+	}
+	result := make([]numberedMedia, 0, len(numbers))
+	for _, number := range numbers {
+		item, ok := byNumber[number]
+		if !ok {
+			return nil, fmt.Errorf("attachment %d is not available to this run", number)
+		}
+		item.value.Data = append([]byte(nil), item.value.Data...)
+		result = append(result, item)
+	}
+	return result, nil
+}
+
+func visibleMedia(input []numberedMedia) []model.Media {
+	result := make([]model.Media, len(input))
+	for index, item := range input {
+		result[index] = item.value
+	}
+	return result
 }

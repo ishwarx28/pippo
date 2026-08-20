@@ -27,6 +27,13 @@ type Request struct {
 	Blocks  []Block
 	Tools   []Tool
 	History []Message
+	Media   []Media
+}
+
+type Media struct {
+	Label string
+	MIME  string
+	Data  []byte
 }
 
 type Chunk struct {

@@ -5,7 +5,7 @@ use crate::{
     key::Key,
     proj::{Proj, TaskStatus},
     rule::{self, Decision, Request as RuleRequest},
-    sess::{Call, RunCreate, RunRole, RunStatus, Runs, Status},
+    sess::{Call, RunCreate, RunMeta, RunReport, RunRole, RunStatus, Runs, Status},
     tool::{find, shell, write},
 };
 use anyhow::{Context, Result};
@@ -1130,13 +1130,20 @@ enum RunInput {
     },
 }
 
+#[derive(Serialize)]
+struct RunReply {
+    #[serde(flatten)]
+    meta: RunMeta,
+    reports: Vec<RunReport>,
+}
+
 fn run(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
     let input: RunInput =
         serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
             code: -32602,
             message: format!("decode run request: {error}"),
         })?;
-    let result = match input {
+    match input {
         RunInput::Create {
             parent_id,
             task_id,
@@ -1155,31 +1162,55 @@ fn run(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fai
                 }
                 None => (None, None),
             };
-            shared.runs.create(RunCreate {
-                parent_id,
-                task_id,
-                project_id,
-                role,
-                title,
-                request,
-                constraints,
-                media,
-                related,
-                highlight,
-            })
+            let reports = match project_id.as_deref() {
+                Some(project) => {
+                    shared
+                        .proj
+                        .related(project, &related)
+                        .map_err(invalid_failure)?;
+                    shared
+                        .runs
+                        .reports(project, &related, &highlight)
+                        .map_err(invalid_failure)?
+                }
+                None if related.is_empty() && highlight.is_empty() => Vec::new(),
+                None => {
+                    return Err(invalid_failure(anyhow::anyhow!(
+                        "a scout cannot receive reports"
+                    )))
+                }
+            };
+            let meta = shared
+                .runs
+                .create(RunCreate {
+                    parent_id,
+                    task_id,
+                    project_id,
+                    role,
+                    title,
+                    request,
+                    constraints,
+                    media,
+                    related,
+                    highlight,
+                })
+                .map_err(invalid_failure)?;
+            serde_json::to_value(RunReply { meta, reports })
+                .map_err(|error| internal_failure(error.into()))
         }
         RunInput::Update {
             id,
             status,
             attempt,
             report,
-        } => shared.runs.update(&id, status, attempt, report),
+        } => {
+            let meta = shared
+                .runs
+                .update(&id, status, attempt, report)
+                .map_err(invalid_failure)?;
+            serde_json::to_value(meta).map_err(|error| internal_failure(error.into()))
+        }
     }
-    .map_err(invalid_failure)?;
-    serde_json::to_value(result).map_err(|error| Failure {
-        code: -32603,
-        message: format!("encode run result: {error}"),
-    })
 }
 
 fn find(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {

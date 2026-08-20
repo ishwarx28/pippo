@@ -127,3 +127,54 @@ fn persists_transitions_and_interrupts_running_runs_on_reopen() {
     assert_eq!(interrupted.0.status, RunStatus::Interrupted);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn resolves_only_registered_report_versions_in_stable_order() {
+    let root = root();
+    let runs = Runs::open(root.clone()).unwrap();
+    let mut parent = input(None);
+    parent.title = "parent findings".into();
+    parent.related.clear();
+    parent.highlight.clear();
+    let parent = runs.create(parent).unwrap();
+    let mut child = input(Some(parent.id.clone()));
+    child.title = "child findings".into();
+    child.related.clear();
+    child.highlight.clear();
+    let child = runs.create(child).unwrap();
+    runs.update(&child.id, RunStatus::Done, 1, Some("child body".into()))
+        .unwrap();
+    runs.update(&parent.id, RunStatus::Done, 1, Some("old body".into()))
+        .unwrap();
+    runs.update(&parent.id, RunStatus::Running, 2, None)
+        .unwrap();
+    runs.update(&parent.id, RunStatus::Done, 2, Some("latest body".into()))
+        .unwrap();
+
+    let old = PathBuf::from("projects/pippo_123abc/reports/t_1234abcd/parent_findings.md");
+    let child_path = PathBuf::from("projects/pippo_123abc/reports/t_1234abcd/child_findings.md");
+    let reports = runs
+        .reports(
+            "pippo_123abc",
+            &["t_1234abcd".into()],
+            &[old.clone(), child_path.clone(), old.clone()],
+        )
+        .unwrap();
+    assert_eq!(reports.len(), 3);
+    assert_eq!(reports[0].path, old);
+    assert!(reports[0].central && reports[1].central);
+    assert_eq!(reports[1].path, child_path);
+    assert_eq!(
+        reports[2].path,
+        PathBuf::from("projects/pippo_123abc/reports/t_1234abcd/parent_findings_(2).md")
+    );
+    assert!(!reports[2].central);
+    for invalid in [
+        PathBuf::from("../parent_findings.md"),
+        PathBuf::from("projects/other_ffffff/reports/t_1234abcd/parent_findings.md"),
+        PathBuf::from("projects/pippo_123abc/reports/t_1234abcd/unknown.md"),
+    ] {
+        assert!(runs.reports("pippo_123abc", &[], &[invalid]).is_err());
+    }
+    fs::remove_dir_all(root).unwrap();
+}

@@ -163,6 +163,112 @@ fn run_requests_create_nested_durable_directories() {
 }
 
 #[test]
+fn run_requests_resolve_only_owned_report_paths() {
+    let root = std::env::temp_dir().join(format!("pippo-rpc-proj-{}-reports", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let work = root.join("work");
+    let other = root.join("other");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    let (shared, _interactions) = shared(&root);
+    let first = task(
+        &shared,
+        Some(serde_json::json!({"action": "create", "title": "collect source reports", "path": work})),
+    )
+    .unwrap();
+    let first_task = first["task_id"].as_str().unwrap();
+    let source = run(
+        &shared,
+        Some(serde_json::json!({
+            "action": "create", "task_id": first_task, "role": "explorer",
+            "title": "source findings", "request": "Collect evidence."
+        })),
+    )
+    .unwrap();
+    let source_id = source["id"].as_str().unwrap();
+    for (status, attempt, report) in [
+        ("done", 1, Some("old secret body")),
+        ("running", 2, None),
+        ("done", 2, Some("latest secret body")),
+    ] {
+        run(
+            &shared,
+            Some(serde_json::json!({
+                "action": "update", "id": source_id, "status": status,
+                "attempt": attempt, "report": report
+            })),
+        )
+        .unwrap();
+    }
+    task(
+        &shared,
+        Some(serde_json::json!({
+            "action": "update", "id": first_task, "status": "done", "note": "evidence saved"
+        })),
+    )
+    .unwrap();
+    let second = task(
+        &shared,
+        Some(serde_json::json!({"action": "create", "title": "use source reports", "path": work})),
+    )
+    .unwrap();
+    let second_task = second["task_id"].as_str().unwrap();
+    let old = format!(
+        "projects/{}/reports/{first_task}/source_findings.md",
+        first["project_id"].as_str().unwrap()
+    );
+    let assembled = run(
+        &shared,
+        Some(serde_json::json!({
+            "action": "create", "task_id": second_task, "role": "worker",
+            "title": "use findings", "request": "Use the registered paths.",
+            "related": [first_task], "highlight": [old]
+        })),
+    )
+    .unwrap();
+    assert_eq!(assembled["reports"].as_array().unwrap().len(), 2);
+    assert_eq!(assembled["reports"][0]["path"], old);
+    assert_eq!(assembled["reports"][0]["central"], true);
+    let encoded = assembled.to_string();
+    assert!(!encoded.contains("secret body"));
+    for bad in [
+        serde_json::json!({"related": ["t_ffffffff"], "highlight": []}),
+        serde_json::json!({"related": [], "highlight": ["../source_findings.md"]}),
+    ] {
+        assert!(run(
+            &shared,
+            Some(serde_json::json!({
+                "action": "create", "task_id": second_task, "role": "worker",
+                "title": "reject input", "request": "Reject this.",
+                "related": bad["related"], "highlight": bad["highlight"]
+            }))
+        )
+        .is_err());
+    }
+    task(
+        &shared,
+        Some(serde_json::json!({
+            "action": "update", "id": second_task, "status": "done", "note": "validation complete"
+        })),
+    )
+    .unwrap();
+    let foreign = task(
+        &shared,
+        Some(serde_json::json!({"action": "create", "title": "other project work", "path": other})),
+    )
+    .unwrap();
+    assert!(run(
+        &shared,
+        Some(serde_json::json!({
+            "action": "create", "task_id": foreign["task_id"], "role": "worker",
+            "title": "foreign reports", "request": "Reject this.", "related": [first_task]
+        }))
+    )
+    .is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn find_requests_use_the_active_task_scope() {
     let root = std::env::temp_dir().join(format!("pippo-rpc-proj-{}-find", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);

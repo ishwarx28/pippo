@@ -113,8 +113,9 @@ func TestStreamIsCorrelatedAndCancellable(t *testing.T) {
 	id := callID{Turn: "turn-a", Request: "request-b"}
 	var start accepted
 	if err := client.call(context.Background(), "turn.start", startRequest{
-		callID: id,
-		Query:  "hello",
+		callID:      id,
+		Query:       "hello",
+		Attachments: []mediaInput{{MIME: "image/jpg", Data: []byte{7, 8}}},
 	}, &start); err != nil {
 		t.Fatal(err)
 	}
@@ -124,6 +125,10 @@ func TestStreamIsCorrelatedAndCancellable(t *testing.T) {
 	request := receive(t, provider.started)
 	if request.Model != defaultModel {
 		t.Fatalf("model = %q", request.Model)
+	}
+	if len(request.Media) != 1 || request.Media[0].Label != "attachment 1 · image/jpeg" ||
+		!reflect.DeepEqual(request.Media[0].Data, []byte{7, 8}) {
+		t.Fatalf("turn media = %#v", request.Media)
 	}
 	if got := receive(t, chunks); got.callID != id || got.Text != "first" {
 		t.Fatalf("chunk = %#v", got)
