@@ -243,6 +243,34 @@ impl Sess {
         Ok(self.lock()?.messages.clone())
     }
 
+    pub fn shutdown(&self) -> Result<Option<Event>> {
+        let mut state = self.lock()?;
+        let event = if let Some(active) = state.active.as_ref() {
+            let event = Event::Closed {
+                call: active.call.clone(),
+                message_id: active.assistant.clone(),
+                status: Status::Cancelled,
+                error: None,
+            };
+            let mut next = state.clone();
+            let message = next
+                .messages
+                .iter_mut()
+                .find(|message| message.id == active.assistant)
+                .context("active assistant message is missing")?;
+            message.status = Some(Status::Cancelled);
+            message.error = None;
+            next.active = None;
+            self.commit(&mut state, next, &event)?;
+            Some(event)
+        } else {
+            None
+        };
+        drop(state);
+        self.store.flush()?;
+        Ok(event)
+    }
+
     fn commit(&self, state: &mut MutexGuard<'_, State>, next: State, event: &Event) -> Result<()> {
         self.store.record(event, &next.messages)?;
         **state = next;
@@ -354,6 +382,42 @@ mod tests {
             }
         ));
         assert_eq!(session.request_cancel().unwrap(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shutdown_durably_cancels_once_and_rejects_late_close() {
+        let root = root();
+        let current = session(&root);
+        let start = current.open("wait".into()).unwrap();
+        current.chunk(&start.call, "partial".into()).unwrap();
+        let closed = current.shutdown().unwrap().unwrap();
+        assert!(matches!(
+            closed,
+            Event::Closed {
+                status: Status::Cancelled,
+                ..
+            }
+        ));
+        assert_eq!(current.shutdown().unwrap(), None);
+        assert_eq!(
+            current.close(&start.call, Status::Done, None).unwrap(),
+            None
+        );
+        drop(current);
+
+        let reopened = session(&root);
+        let messages = reopened.snapshot().unwrap();
+        assert_eq!(messages[1].text, "partial");
+        assert_eq!(messages[1].status, Some(Status::Cancelled));
+        assert_eq!(
+            Store::open(root.clone())
+                .unwrap()
+                .messages::<Event>()
+                .unwrap()
+                .len(),
+            3
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

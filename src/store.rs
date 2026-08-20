@@ -85,6 +85,20 @@ impl Store {
         self.replace_replay_locked(replay)
     }
 
+    pub fn flush(&self) -> Result<()> {
+        let _guard = self.lock()?;
+        for path in [self.history_path(), self.replay_path()] {
+            File::open(&path)
+                .with_context(|| format!("open session file {}", path.display()))?
+                .sync_all()
+                .with_context(|| format!("flush session file {}", path.display()))?;
+        }
+        File::open(&self.session)
+            .with_context(|| format!("open session directory {}", self.session.display()))?
+            .sync_all()
+            .with_context(|| format!("flush session directory {}", self.session.display()))
+    }
+
     fn replace_replay_locked<T: Serialize>(&self, replay: &T) -> Result<()> {
         let path = self.replay_path();
         let tmp = self.session.join(".replay.json.tmp");
@@ -207,6 +221,27 @@ mod tests {
         assert!(!root.join("session/.replay.json.tmp").exists());
         drop(store);
         assert!(Store::open(root.clone()).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn flushes_session_files_repeatedly() {
+        let root = root();
+        let store = Store::open(root.clone()).unwrap();
+        store
+            .append(&Message {
+                id: 1,
+                text: "durable".into(),
+            })
+            .unwrap();
+        store.replace_replay(&vec!["durable"]).unwrap();
+        store.flush().unwrap();
+        store.flush().unwrap();
+        drop(store);
+
+        let reopened = Store::open(root.clone()).unwrap();
+        assert_eq!(reopened.messages::<Message>().unwrap()[0].text, "durable");
+        assert_eq!(reopened.replay::<Vec<String>>().unwrap(), vec!["durable"]);
         fs::remove_dir_all(root).unwrap();
     }
 

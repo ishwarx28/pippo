@@ -14,16 +14,28 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::{IpAddr, SocketAddr},
     process::{Child, Command, Stdio},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+use tauri::Manager;
 
 const CHILD_PATH: &str = env!("PIPPO_PIPPOD_PATH");
 const START_TIMEOUT: Duration = Duration::from_secs(3);
+const STOP_TIMEOUT: Duration = Duration::from_secs(3);
+const STOP_POLL: Duration = Duration::from_millis(10);
 
 pub struct Service {
-    child: Mutex<Child>,
+    child: Mutex<Option<Child>>,
+}
+
+#[derive(Default)]
+struct Shutdown {
+    started: AtomicBool,
+    events: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 struct Spawned {
@@ -59,7 +71,7 @@ impl Service {
             }
         });
         let mut service = Self {
-            child: Mutex::new(child),
+            child: Mutex::new(Some(child)),
         };
         let line = received
             .recv_timeout(START_TIMEOUT)
@@ -86,19 +98,43 @@ impl Service {
         })
     }
 
-    fn stop(&mut self) -> Result<()> {
-        let child = self.child_mut()?;
-        if child.try_wait().context("check child process")?.is_none() {
-            child.kill().context("stop child process")?;
+    fn stop(&self) -> Result<bool> {
+        let Some(mut child) = self
+            .child
+            .lock()
+            .map_err(|_| anyhow::anyhow!("child process lock poisoned"))?
+            .take()
+        else {
+            return Ok(true);
+        };
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return Ok(true),
+                Ok(None) if Instant::now() < deadline => thread::sleep(STOP_POLL),
+                Ok(None) => break,
+                Err(error) => {
+                    let kill = child.kill();
+                    let wait = child.wait();
+                    if let Err(kill) = kill {
+                        return Err(error)
+                            .context(format!("check child process; stop failed: {kill}"));
+                    }
+                    wait.context("wait for child process after failed status check")?;
+                    return Err(error).context("check child process");
+                }
+            }
         }
+        child.kill().context("force child process to stop")?;
         child.wait().context("wait for child process")?;
-        Ok(())
+        Ok(false)
     }
 
     fn child_mut(&mut self) -> Result<&mut Child> {
         self.child
             .get_mut()
             .map_err(|_| anyhow::anyhow!("child process lock poisoned"))
+            .and_then(|child| child.as_mut().context("child process already stopped"))
     }
 }
 
@@ -107,6 +143,71 @@ impl Drop for Service {
         if let Err(error) = self.stop() {
             eprintln!("failed to stop child process: {error:#}");
         }
+    }
+}
+
+impl Shutdown {
+    fn set_events(&self, events: thread::JoinHandle<()>) -> Result<()> {
+        let mut slot = self
+            .events
+            .lock()
+            .map_err(|_| anyhow::anyhow!("turn event thread lock poisoned"))?;
+        if slot.replace(events).is_some() {
+            anyhow::bail!("turn event thread already set");
+        }
+        Ok(())
+    }
+
+    fn run(&self, sess: &sess::Sess, rpc: &rpc::Rpc, service: &Service) -> Result<()> {
+        if self.started.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let mut errors = Vec::new();
+        keep(&mut errors, sess.shutdown().map(|_| ()), "close session");
+        keep(
+            &mut errors,
+            rpc.call::<_, ShutdownAccepted>("shutdown", &())
+                .and_then(|reply| {
+                    if reply.accepted {
+                        Ok(())
+                    } else {
+                        anyhow::bail!("child process was already shutting down")
+                    }
+                }),
+            "request child shutdown",
+        );
+        keep(&mut errors, rpc.shutdown(), "close rpc");
+        let events = self.events.lock().map(|mut events| events.take());
+        match events {
+            Ok(Some(events)) => {
+                if events.join().is_err() {
+                    errors.push("join turn events: thread panicked".into());
+                }
+            }
+            Ok(_) => {}
+            Err(_) => errors.push("join turn events: lock poisoned".into()),
+        }
+        keep(
+            &mut errors,
+            service.stop().map(|_| ()),
+            "stop child process",
+        );
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(errors.join("; "))
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ShutdownAccepted {
+    accepted: bool,
+}
+
+fn keep(errors: &mut Vec<String>, result: Result<()>, action: &str) {
+    if let Err(error) = result {
+        errors.push(format!("{action}: {error:#}"));
     }
 }
 
@@ -140,14 +241,16 @@ fn run() -> Result<()> {
     )?;
     let notices = rpc.take_notices()?;
     let event_sess = Arc::clone(&sess);
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(cfg)
         .manage(key)
         .manage(sess)
         .manage(rpc)
         .manage(spawned.service)
+        .manage(Shutdown::default())
         .setup(move |app| {
-            ipc::listen(app.handle().clone(), event_sess, notices)?;
+            let events = ipc::listen(app.handle().clone(), event_sess, notices)?;
+            app.state::<Shutdown>().set_events(events)?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -158,8 +261,23 @@ fn run() -> Result<()> {
             ipc::send_message,
             ipc::stop_turn
         ])
-        .run(tauri::generate_context!())
-        .map_err(Into::into)
+        .build(tauri::generate_context!())?;
+    app.run(|app, event| {
+        if matches!(
+            event,
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
+        ) {
+            let result = app.state::<Shutdown>().run(
+                app.state::<Arc<sess::Sess>>().inner(),
+                app.state::<rpc::Rpc>().inner(),
+                app.state::<Service>().inner(),
+            );
+            if let Err(error) = result {
+                eprintln!("shutdown failed: {error:#}");
+            }
+        }
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -198,10 +316,39 @@ mod tests {
                 call.join().unwrap();
             }
         });
-        drop(rpc);
+        let stopped: ShutdownAccepted = rpc.call("shutdown", &()).unwrap();
+        assert!(stopped.accepted);
+        rpc.shutdown().unwrap();
         let addr = spawned.addr;
-        let mut service = spawned.service;
-        service.stop().unwrap();
+        let service = spawned.service;
+        assert!(service.stop().unwrap());
+        assert!(service.stop().unwrap());
         assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_err());
+    }
+
+    #[test]
+    fn repeated_shutdown_flushes_the_cancelled_turn() {
+        let root = std::env::temp_dir().join(format!(
+            "pippo-shutdown-{}-{}",
+            std::process::id(),
+            token().unwrap()
+        ));
+        let store = store::Store::open(root.clone()).unwrap();
+        let sess = sess::Sess::new(store).unwrap();
+        let turn = sess.open("persist me".into()).unwrap();
+        sess.chunk(&turn.call, "partial".into()).unwrap();
+        let spawned = Service::spawn().unwrap();
+        let hello = rpc::Hello::new(&root, &cfg::Config::default()).unwrap();
+        let rpc = rpc::Rpc::connect(spawned.addr, spawned.token, &hello, key::Key).unwrap();
+        let shutdown = Shutdown::default();
+
+        shutdown.run(&sess, &rpc, &spawned.service).unwrap();
+        shutdown.run(&sess, &rpc, &spawned.service).unwrap();
+
+        let restored = sess::Sess::new(store::Store::open(root.clone()).unwrap()).unwrap();
+        let messages = restored.snapshot().unwrap();
+        assert_eq!(messages[1].text, "partial");
+        assert_eq!(messages[1].status, Some(sess::Status::Cancelled));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

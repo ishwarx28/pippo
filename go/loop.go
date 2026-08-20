@@ -71,6 +71,8 @@ type loop struct {
 	provider model.Provider
 	mu       sync.Mutex
 	active   map[callID]context.CancelFunc
+	runs     sync.WaitGroup
+	stopping bool
 }
 
 func newLoop(provider model.Provider) *loop {
@@ -80,11 +82,12 @@ func newLoop(provider model.Provider) *loop {
 func (l *loop) start(ctx context.Context, id callID) (context.Context, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if _, exists := l.active[id]; exists {
+	if _, exists := l.active[id]; l.stopping || exists {
 		return nil, false
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	l.active[id] = cancel
+	l.runs.Add(1)
 	return ctx, true
 }
 
@@ -92,6 +95,7 @@ func (l *loop) finish(id callID) {
 	l.mu.Lock()
 	delete(l.active, id)
 	l.mu.Unlock()
+	l.runs.Done()
 }
 
 func (l *loop) cancel(id callID) bool {
@@ -103,6 +107,20 @@ func (l *loop) cancel(id callID) bool {
 	}
 	cancel()
 	return true
+}
+
+func (l *loop) stop() {
+	l.mu.Lock()
+	l.stopping = true
+	cancels := make([]context.CancelFunc, 0, len(l.active))
+	for _, cancel := range l.active {
+		cancels = append(cancels, cancel)
+	}
+	l.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	l.runs.Wait()
 }
 
 func startTurn(state *state) handler {

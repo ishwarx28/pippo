@@ -143,6 +143,26 @@ func TestStreamIsCorrelatedAndCancellable(t *testing.T) {
 	}
 }
 
+func TestLoopStopCancelsActiveWorkAndRefusesMore(t *testing.T) {
+	current := newLoop(&blockingProvider{started: make(chan model.Request, 1)})
+	id := callID{Turn: "turn-stop", Request: "request-stop"}
+	ctx, started := current.start(context.Background(), id)
+	if !started {
+		t.Fatal("work did not start")
+	}
+	finished := make(chan struct{})
+	go func() {
+		<-ctx.Done()
+		current.finish(id)
+		close(finished)
+	}()
+	current.stop()
+	<-finished
+	if _, started := current.start(context.Background(), callID{Turn: "late", Request: "late"}); started {
+		t.Fatal("work started after shutdown")
+	}
+}
+
 type blockingProvider struct {
 	started chan model.Request
 	mu      sync.Mutex

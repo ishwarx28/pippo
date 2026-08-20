@@ -37,6 +37,7 @@ type handler func(context.Context, *rpc, json.RawMessage) (any, error)
 type rpc struct {
 	conn     *websocket.Conn
 	handlers map[string]handler
+	after    func(string)
 	write    sync.Mutex
 	pending  sync.Mutex
 	waits    map[uint64]chan message
@@ -98,6 +99,9 @@ func (r *rpc) dispatch(ctx context.Context, input message) {
 		return
 	}
 	r.respond(*input.ID, result, nil)
+	if r.after != nil {
+		r.after(input.Method)
+	}
 }
 
 func (r *rpc) call(ctx context.Context, method string, params, result any) error {
@@ -199,10 +203,22 @@ type hello struct {
 }
 
 type state struct {
-	mu    sync.RWMutex
-	hello *hello
-	peer  *rpc
-	loop  *loop
+	mu       sync.RWMutex
+	hello    *hello
+	peer     *rpc
+	loop     *loop
+	stop     chan struct{}
+	ack      chan struct{}
+	halt     sync.Once
+	ackClose sync.Once
+}
+
+func newState(provider model.Provider) *state {
+	return &state{
+		loop: newLoop(provider),
+		stop: make(chan struct{}),
+		ack:  make(chan struct{}),
+	}
 }
 
 func (s *state) attach(peer *rpc) {
@@ -248,8 +264,25 @@ func (s *state) startup() *hello {
 	return &value
 }
 
-func server(guard *auth) *http.Server {
-	return &http.Server{Handler: routes(guard, &state{loop: newLoop(model.Gemini{})})}
+func (s *state) beginShutdown() bool {
+	started := false
+	s.halt.Do(func() {
+		started = true
+		go func() {
+			if s.loop != nil {
+				s.loop.stop()
+			}
+			<-s.ack
+			close(s.stop)
+		}()
+	})
+	return started
+}
+
+func (s *state) responseSent(method string) {
+	if method == "shutdown" {
+		s.ackClose.Do(func() { close(s.ack) })
+	}
 }
 
 func routes(guard *auth, state *state) http.Handler {
@@ -273,6 +306,7 @@ func routes(guard *auth, state *state) http.Handler {
 			return
 		}
 		peer := newRPC(conn, handlers(state))
+		peer.after = state.responseSent
 		state.attach(peer)
 		defer state.detach(peer)
 		peer.serve(request.Context())
@@ -305,6 +339,9 @@ func handlers(state *state) map[string]handler {
 		},
 		"health": func(_ context.Context, _ *rpc, _ json.RawMessage) (any, error) {
 			return map[string]bool{"ready": state.ready()}, nil
+		},
+		"shutdown": func(_ context.Context, _ *rpc, _ json.RawMessage) (any, error) {
+			return map[string]bool{"accepted": state.beginShutdown()}, nil
 		},
 		"turn.start":  startTurn(state),
 		"turn.cancel": cancelTurn(state),

@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/subtle"
 	"encoding/hex"
 	"errors"
@@ -14,7 +15,12 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
+
+	"pippo/go/model"
 )
+
+const shutdownTimeout = 3 * time.Second
 
 type auth struct {
 	mu    sync.Mutex
@@ -54,17 +60,37 @@ func run(args []string, stdin io.Reader, ready io.Writer) (result error) {
 		return fmt.Errorf("listen on loopback: %w", err)
 	}
 	defer func() {
-		if err := listener.Close(); result == nil && err != nil {
+		if err := listener.Close(); result == nil && err != nil && !errors.Is(err, net.ErrClosed) {
 			result = fmt.Errorf("close loopback listener: %w", err)
 		}
 	}()
 
-	server := server(&auth{token: token})
+	state := newState(model.Gemini{})
+	server := &http.Server{Handler: routes(&auth{token: token}, state)}
 	if _, err := fmt.Fprintln(ready, listener.Addr().String()); err != nil {
 		return fmt.Errorf("report listen address: %w", err)
 	}
-	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return fmt.Errorf("serve loopback: %w", err)
+	watch, cancel := context.WithCancel(context.Background())
+	stopped := make(chan error, 1)
+	go func() {
+		select {
+		case <-state.stop:
+			ctx, stop := context.WithTimeout(context.Background(), shutdownTimeout)
+			err := server.Shutdown(ctx)
+			stop()
+			stopped <- err
+		case <-watch.Done():
+			stopped <- nil
+		}
+	}()
+	serveErr := server.Serve(listener)
+	cancel()
+	stopErr := <-stopped
+	if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+		return fmt.Errorf("serve loopback: %w", serveErr)
+	}
+	if stopErr != nil {
+		return fmt.Errorf("shut down loopback: %w", stopErr)
 	}
 	return nil
 }

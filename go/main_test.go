@@ -2,12 +2,15 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -59,6 +62,47 @@ func TestRunRejectsNonLoopbackBeforeListening(t *testing.T) {
 	err := run([]string{"--listen", "0.0.0.0:0"}, strings.NewReader(validToken+"\n"), io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "loopback") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestProtocolShutdownStopsRun(t *testing.T) {
+	readyRead, readyWrite := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		done <- run(
+			[]string{"--listen", "127.0.0.1:0"},
+			strings.NewReader(validToken+"\n"),
+			readyWrite,
+		)
+	}()
+	address, err := bufio.NewReader(readyRead).ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := dialRPC(t, "http://"+strings.TrimSpace(address), validToken)
+	var reply struct {
+		Accepted bool `json:"accepted"`
+	}
+	if err := client.call(context.Background(), "shutdown", struct{}{}, &reply); err != nil {
+		t.Fatal(err)
+	}
+	if !reply.Accepted {
+		t.Fatal("shutdown was not accepted")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("service did not stop after protocol shutdown")
+	}
+	client.close()
+	if err := readyRead.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := readyWrite.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

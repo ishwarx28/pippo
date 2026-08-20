@@ -69,7 +69,7 @@ pub fn listen(
     app: AppHandle,
     sess: Arc<Sess>,
     input: std::sync::mpsc::Receiver<Stamped>,
-) -> Result<()> {
+) -> Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("turn-events".into())
         .spawn(move || {
@@ -86,8 +86,7 @@ pub fn listen(
                 eprintln!("rpc closed with unordered turn notifications");
             }
         })
-        .context("start turn event listener")?;
-    Ok(())
+        .context("start turn event listener")
 }
 
 fn send(app: &AppHandle, sess: &Sess, rpc: &Rpc, text: String) -> Result<Call> {

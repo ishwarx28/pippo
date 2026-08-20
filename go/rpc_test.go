@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -80,6 +81,45 @@ func TestRPCHandlesConcurrentCallsBothWays(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+func TestPendingRPCCallerUnblocksWhenConnectionCloses(t *testing.T) {
+	token, err := readToken(strings.NewReader(validToken + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := &state{}
+	server := httptest.NewServer(routes(&auth{token: token}, state))
+	defer server.Close()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	client := dialRPCWith(t, server.URL, validToken, map[string]handler{
+		"wait": func(context.Context, *rpc, json.RawMessage) (any, error) {
+			close(started)
+			<-release
+			return map[string]bool{"done": true}, nil
+		},
+	})
+	defer client.close()
+	peer := state.connection()
+	if peer == nil {
+		t.Fatal("server peer is missing")
+	}
+	finished := make(chan error, 1)
+	go func() {
+		finished <- peer.call(context.Background(), "wait", struct{}{}, nil)
+	}()
+	<-started
+	peer.close()
+	select {
+	case err := <-finished:
+		if err == nil || !strings.Contains(err.Error(), "connection closed") {
+			t.Fatalf("call error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending RPC caller stayed blocked")
+	}
+	close(release)
 }
 
 func dialRPC(t *testing.T, address, token string) *rpc {

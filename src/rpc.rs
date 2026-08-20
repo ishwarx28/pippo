@@ -122,9 +122,14 @@ pub struct Stamped {
 }
 
 struct Shared {
-    waits: Mutex<HashMap<u64, mpsc::SyncSender<Answer>>>,
-    notices: mpsc::Sender<Stamped>,
+    pending: Mutex<Pending>,
+    notices: Mutex<Option<mpsc::Sender<Stamped>>>,
     key: Key,
+}
+
+struct Pending {
+    waits: HashMap<u64, mpsc::SyncSender<Answer>>,
+    closed: bool,
 }
 
 struct Inner {
@@ -153,8 +158,11 @@ impl Rpc {
     fn open(addr: SocketAddr, token: String, key: Key) -> Result<Self> {
         let (notice_send, notice_receive) = mpsc::channel();
         let shared = Arc::new(Shared {
-            waits: Mutex::new(HashMap::new()),
-            notices: notice_send,
+            pending: Mutex::new(Pending {
+                waits: HashMap::new(),
+                closed: false,
+            }),
+            notices: Mutex::new(Some(notice_send)),
             key,
         });
         let (send, receive) = async_mpsc::unbounded_channel();
@@ -172,9 +180,12 @@ impl Rpc {
                         addr, token, background, output, receive, started,
                     ))
                 });
-            if let Err(error) = result {
-                fail_all(&failed, error);
-            }
+            fail_all(
+                &failed,
+                result
+                    .err()
+                    .unwrap_or_else(|| "rpc connection closed".into()),
+            );
         });
         let inner = Arc::new(Inner {
             shared,
@@ -206,12 +217,18 @@ impl Rpc {
         };
         let text = serde_json::to_string(&request).context("encode rpc request")?;
         let (sent, received) = mpsc::sync_channel(1);
-        self.inner
-            .shared
-            .waits
-            .lock()
-            .map_err(|_| anyhow::anyhow!("rpc pending lock poisoned"))?
-            .insert(id, sent);
+        {
+            let mut pending = self
+                .inner
+                .shared
+                .pending
+                .lock()
+                .map_err(|_| anyhow::anyhow!("rpc pending lock poisoned"))?;
+            if pending.closed {
+                anyhow::bail!("rpc connection is closed");
+            }
+            pending.waits.insert(id, sent);
+        }
         if self.inner.send.send(Command::Message(text)).is_err() {
             self.forget(id)?;
             anyhow::bail!("rpc connection is closed");
@@ -235,12 +252,29 @@ impl Rpc {
             .context("rpc notices already taken")
     }
 
+    pub fn shutdown(&self) -> Result<()> {
+        close_shared(&self.inner.shared, "rpc connection closed");
+        let _ = self.inner.send.send(Command::Close);
+        let mut thread = self
+            .inner
+            .thread
+            .lock()
+            .map_err(|_| anyhow::anyhow!("rpc thread lock poisoned"))?;
+        if let Some(thread) = thread.take() {
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("rpc thread panicked"))?;
+        }
+        Ok(())
+    }
+
     fn forget(&self, id: u64) -> Result<()> {
         self.inner
             .shared
-            .waits
+            .pending
             .lock()
             .map_err(|_| anyhow::anyhow!("rpc pending lock poisoned"))?
+            .waits
             .remove(&id);
         Ok(())
     }
@@ -248,9 +282,8 @@ impl Rpc {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        if self.send.send(Command::Close).is_err() {
-            eprintln!("rpc connection already closed");
-        }
+        close_shared(&self.shared, "rpc connection closed");
+        let _ = self.send.send(Command::Close);
         match self.thread.get_mut() {
             Ok(thread) => {
                 if let Some(thread) = thread.take() {
@@ -424,9 +457,9 @@ fn dispatch(
         Some(error) => Err(format!("{} ({})", error.message, error.code)),
         None => Ok(input.result.unwrap_or(Value::Null)),
     };
-    match shared.waits.lock() {
-        Ok(mut waits) => {
-            if let Some(wait) = waits.remove(&id) {
+    match shared.pending.lock() {
+        Ok(mut pending) => {
+            if let Some(wait) = pending.waits.remove(&id) {
                 if wait.send(answer).is_err() {
                     eprintln!("rpc caller stopped waiting for {id}");
                 }
@@ -465,7 +498,19 @@ fn send_notice<T: for<'de> Deserialize<'de>>(
         .map(map)
         .map_err(|error| format!("decode turn notification: {error}"));
     let failed = notice.as_ref().err().cloned();
-    if shared.notices.send(Stamped { order, notice }).is_err() {
+    let notices = shared.notices.lock().map_err(|_| Failure {
+        code: -32603,
+        message: "rpc notice lock poisoned".into(),
+    })?;
+    if notices
+        .as_ref()
+        .ok_or_else(|| Failure {
+            code: -32603,
+            message: "turn notification receiver is closed".into(),
+        })?
+        .send(Stamped { order, notice })
+        .is_err()
+    {
         return Err(Failure {
             code: -32603,
             message: "turn notification receiver is closed".into(),
@@ -505,14 +550,55 @@ fn respond(
 }
 
 fn fail_all(shared: &Shared, error: String) {
-    match shared.waits.lock() {
-        Ok(mut waits) => {
-            for (_, wait) in waits.drain() {
-                if wait.send(Err(error.clone())).is_err() {
-                    eprintln!("rpc caller stopped waiting");
-                }
-            }
+    close_shared(shared, &error);
+}
+
+fn close_shared(shared: &Shared, error: &str) {
+    let waits = {
+        let mut pending = match shared.pending.lock() {
+            Ok(pending) => pending,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        pending.closed = true;
+        pending
+            .waits
+            .drain()
+            .map(|(_, wait)| wait)
+            .collect::<Vec<_>>()
+    };
+    match shared.notices.lock() {
+        Ok(mut notices) => notices.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    for wait in waits {
+        if wait.send(Err(error.into())).is_err() {
+            eprintln!("rpc caller stopped waiting");
         }
-        Err(_) => eprintln!("rpc pending lock poisoned"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closing_connection_unblocks_pending_callers() {
+        let (notices, _input) = mpsc::channel();
+        let (answer, received) = mpsc::sync_channel(1);
+        let shared = Shared {
+            pending: Mutex::new(Pending {
+                waits: HashMap::from([(7, answer)]),
+                closed: false,
+            }),
+            notices: Mutex::new(Some(notices)),
+            key: Key,
+        };
+
+        close_shared(&shared, "stopped");
+        let error = received.recv().unwrap().unwrap_err();
+        assert_eq!(error, "stopped");
+        close_shared(&shared, "stopped again");
+        assert!(shared.pending.lock().unwrap().closed);
+        assert!(shared.notices.lock().unwrap().is_none());
     }
 }
