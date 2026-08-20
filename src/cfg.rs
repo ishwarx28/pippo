@@ -1,10 +1,9 @@
 // Owns cfg/ loading, defaults and runtime-root creation.
 
+use crate::rule;
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
-
-const RULES: &str = "rules: []\n";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
@@ -180,10 +179,14 @@ pub struct Account {
 }
 
 pub fn root() -> Result<PathBuf> {
+    Ok(home()?.join(".pippo"))
+}
+
+pub fn home() -> Result<PathBuf> {
     let home = env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .context("home directory is unavailable")?;
-    Ok(PathBuf::from(home).join(".pippo"))
+    Ok(PathBuf::from(home))
 }
 
 pub fn load_at(root: PathBuf) -> Result<Config> {
@@ -204,8 +207,11 @@ pub fn load_at(root: PathBuf) -> Result<Config> {
 
     let rules_path = dir.join("rules.yaml");
     if !rules_path.exists() {
-        fs::write(&rules_path, RULES)
+        fs::write(&rules_path, rule::DEFAULTS)
             .with_context(|| format!("write default config {}", rules_path.display()))?;
+    } else if fs::read_to_string(&rules_path)?.trim() == "rules: []" {
+        fs::write(&rules_path, rule::DEFAULTS)
+            .with_context(|| format!("upgrade default config {}", rules_path.display()))?;
     }
     fs::read(&rules_path).with_context(|| format!("read config {}", rules_path.display()))?;
 
@@ -286,6 +292,7 @@ mod tests {
             }"#,
         )
         .unwrap();
+        fs::write(dir.join("rules.yaml"), "rules: []\n").unwrap();
 
         let cfg = load_at(root.clone()).unwrap();
         assert_eq!(cfg.compact_at, 0.75);
@@ -294,6 +301,10 @@ mod tests {
         assert_eq!(cfg.ui.left_width, 200);
         assert_eq!(cfg.ui.right_width, 420);
         assert!(cfg.sync);
+        assert_eq!(
+            fs::read_to_string(dir.join("rules.yaml")).unwrap(),
+            rule::DEFAULTS
+        );
 
         let saved: serde_json::Value =
             serde_json::from_slice(&fs::read(dir.join("config.json")).unwrap()).unwrap();

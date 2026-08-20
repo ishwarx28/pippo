@@ -49,6 +49,7 @@ pub struct Reads {
 pub struct WriteInput {
     pub turn_id: String,
     pub request_id: String,
+    pub call_id: String,
     pub task_id: Option<String>,
     pub path: PathBuf,
     pub content: String,
@@ -59,6 +60,7 @@ pub struct WriteInput {
 pub struct EditInput {
     pub turn_id: String,
     pub request_id: String,
+    pub call_id: String,
     pub task_id: Option<String>,
     pub path: PathBuf,
     pub target: String,
@@ -229,6 +231,14 @@ fn target(
     let parent = fs::canonicalize(parent).map_err(find::io_failure)?;
     find::guard(&parent)?;
     Ok(parent.join(name))
+}
+
+pub(crate) fn policy_path(
+    scope: &Scope,
+    input: &Path,
+    must_exist: bool,
+) -> std::result::Result<PathBuf, find::Failure> {
+    target(scope, input, must_exist)
 }
 
 fn read(path: &Path) -> std::result::Result<String, find::Failure> {

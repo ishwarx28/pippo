@@ -6,6 +6,7 @@ mod ipc;
 mod key;
 mod proj;
 mod rpc;
+mod rule;
 mod sess;
 mod store;
 mod tool {
@@ -243,6 +244,7 @@ fn run() -> Result<()> {
     let store = store::Store::open(root.clone())?;
     let sess = Arc::new(sess::Sess::new(store)?);
     let proj = Arc::new(proj::Proj::open(root.clone())?);
+    let rules = rule::Book::open(&root, &cfg::home()?)?;
     let spawned = Service::spawn()?;
     let key = key::Key;
     let rpc = rpc::Rpc::connect(
@@ -251,6 +253,7 @@ fn run() -> Result<()> {
         &rpc::Hello::new(&root, &cfg)?,
         key,
         Arc::clone(&proj),
+        rules,
     )?;
     let notices = rpc.take_notices()?;
     let interactions = rpc.take_interactions()?;
@@ -276,7 +279,9 @@ fn run() -> Result<()> {
             ipc::send_message,
             ipc::stop_turn,
             ipc::answer_clarify,
-            ipc::cancel_clarify
+            ipc::cancel_clarify,
+            ipc::answer_approval,
+            ipc::cancel_approval
         ])
         .build(tauri::generate_context!())?;
     app.run(|app, event| {
@@ -322,15 +327,25 @@ mod tests {
         ));
         let hello = rpc::Hello::new(&root, &cfg::Config::default()).unwrap();
         let proj = Arc::new(proj::Proj::open(root.clone()).unwrap());
+        cfg::load_at(root.clone()).unwrap();
         let rpc = rpc::Rpc::connect(
             spawned.addr,
             spawned.token.clone(),
             &hello,
             key::Key,
             Arc::clone(&proj),
+            rule::Book::open(&root, &root).unwrap(),
         )
         .unwrap();
-        assert!(rpc::Rpc::connect(spawned.addr, spawned.token, &hello, key::Key, proj).is_err());
+        assert!(rpc::Rpc::connect(
+            spawned.addr,
+            spawned.token,
+            &hello,
+            key::Key,
+            proj,
+            rule::Book::open(&root, &root).unwrap()
+        )
+        .is_err());
 
         thread::scope(|scope| {
             let calls: Vec<_> = (0..16)
@@ -371,7 +386,16 @@ mod tests {
         let spawned = Service::spawn().unwrap();
         let hello = rpc::Hello::new(&root, &cfg::Config::default()).unwrap();
         let proj = Arc::new(proj::Proj::open(root.clone()).unwrap());
-        let rpc = rpc::Rpc::connect(spawned.addr, spawned.token, &hello, key::Key, proj).unwrap();
+        cfg::load_at(root.clone()).unwrap();
+        let rpc = rpc::Rpc::connect(
+            spawned.addr,
+            spawned.token,
+            &hello,
+            key::Key,
+            proj,
+            rule::Book::open(&root, &root).unwrap(),
+        )
+        .unwrap();
         let shutdown = Shutdown::default();
 
         shutdown.run(&sess, &rpc, &spawned.service).unwrap();

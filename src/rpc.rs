@@ -4,6 +4,7 @@ use crate::{
     cfg::Config,
     key::Key,
     proj::{Proj, TaskStatus},
+    rule::{self, Decision, Request as RuleRequest},
     sess::{Call, Status},
     tool::{find, shell, write},
 };
@@ -105,6 +106,15 @@ enum Command {
 
 type Answer = std::result::Result<Value, String>;
 type ClarifyAnswer = std::result::Result<String, String>;
+type ApprovalAnswer = std::result::Result<ApprovalChoice, String>;
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalChoice {
+    AllowOnce,
+    AllowSession,
+    Deny,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ClarifyOption {
@@ -127,6 +137,14 @@ pub enum Interaction {
         prompt: ClarifyPrompt,
     },
     ClarifyClosed {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    ApprovalOpened {
+        prompt: rule::Prompt,
+    },
+    ApprovalClosed {
         id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
@@ -156,8 +174,11 @@ struct Shared {
     notices: Mutex<Option<mpsc::Sender<Stamped>>>,
     interactions: Mutex<Option<mpsc::Sender<Interaction>>>,
     clarify: Mutex<ClarifyState>,
+    approval: Mutex<ApprovalState>,
+    sheet: Mutex<SheetState>,
     key: Key,
     proj: Arc<Proj>,
+    rules: rule::Book,
     reads: write::Reads,
     shells: shell::Shells,
 }
@@ -177,8 +198,32 @@ struct ClarifyPending {
 
 #[derive(Default)]
 struct ClarifyState {
-    next: u64,
     active: Option<ClarifyPending>,
+}
+
+#[derive(Clone, PartialEq)]
+struct ApprovalKey {
+    turn: String,
+    request: String,
+    call: String,
+}
+
+struct ApprovalPending {
+    id: String,
+    key: ApprovalKey,
+    ask: rule::Ask,
+    answer: mpsc::SyncSender<ApprovalAnswer>,
+}
+
+#[derive(Default)]
+struct ApprovalState {
+    active: Option<ApprovalPending>,
+}
+
+#[derive(Default)]
+struct SheetState {
+    next: u64,
+    active: Option<String>,
 }
 
 struct Pending {
@@ -207,8 +252,9 @@ impl Rpc {
         hello: &Hello,
         key: Key,
         proj: Arc<Proj>,
+        rules: rule::Book,
     ) -> Result<Self> {
-        let rpc = Self::open(addr, token, key, proj)?;
+        let rpc = Self::open(addr, token, key, proj, rules)?;
         let ready: Ready = rpc.call("hello", hello)?;
         if !ready.ready {
             anyhow::bail!("child process did not accept startup hello");
@@ -216,7 +262,13 @@ impl Rpc {
         Ok(rpc)
     }
 
-    fn open(addr: SocketAddr, token: String, key: Key, proj: Arc<Proj>) -> Result<Self> {
+    fn open(
+        addr: SocketAddr,
+        token: String,
+        key: Key,
+        proj: Arc<Proj>,
+        rules: rule::Book,
+    ) -> Result<Self> {
         let (notice_send, notice_receive) = mpsc::channel();
         let (interaction_send, interaction_receive) = mpsc::channel();
         let shared = Arc::new(Shared {
@@ -227,8 +279,11 @@ impl Rpc {
             notices: Mutex::new(Some(notice_send)),
             interactions: Mutex::new(Some(interaction_send)),
             clarify: Mutex::new(ClarifyState::default()),
+            approval: Mutex::new(ApprovalState::default()),
+            sheet: Mutex::new(SheetState::default()),
             key,
             proj,
+            rules,
             reads: write::Reads::default(),
             shells: shell::Shells::default(),
         });
@@ -343,6 +398,14 @@ impl Rpc {
             id,
             Err("clarification cancelled".into()),
         )
+    }
+
+    pub fn answer_approval(&self, id: &str, choice: ApprovalChoice) -> Result<()> {
+        resolve_approval(&self.inner.shared, id, Ok(choice))
+    }
+
+    pub fn cancel_approval(&self, id: &str) -> Result<()> {
+        resolve_approval(&self.inner.shared, id, Err("approval denied".into()))
     }
 
     pub fn shutdown(&self) -> Result<()> {
@@ -463,7 +526,10 @@ async fn connection(
                     };
                     let shared = Arc::clone(&read_shared);
                     let output = output.clone();
-                    if input.method.as_deref() == Some("runtime.shell") {
+                    if matches!(
+                        input.method.as_deref(),
+                        Some("runtime.write" | "runtime.edit" | "runtime.shell")
+                    ) {
                         tokio::task::spawn_blocking(move || dispatch(shared, output, input, order));
                     } else {
                         tokio::spawn(async move { dispatch(shared, output, input, order) });
@@ -531,6 +597,7 @@ fn dispatch(
             "runtime.edit" => edit(&shared, input.params),
             "runtime.shell" => shell(&shared, input.params),
             "runtime.shell.cancel" => cancel_shell(&shared, input.params),
+            "runtime.approval.cancel" => cancel_approval(&shared, input.params),
             "runtime.clarify.cancel" => cancel_clarify(&shared, input.params),
             "turn.chunk" => {
                 send_notice(&shared, order, input.params, |value: Chunk| Notice::Chunk {
@@ -617,52 +684,44 @@ fn start_clarify(
         respond(output, id, None, Some(error));
         return;
     }
+    let prompt_id = match open_sheet(&shared, "clarify") {
+        Ok(id) => id,
+        Err(error) => {
+            respond(output, id, None, Some(error));
+            return;
+        }
+    };
     let (answer, received) = mpsc::sync_channel(1);
-    let prompt = {
-        let mut state = match shared.clarify.lock() {
-            Ok(state) => state,
-            Err(_) => {
-                respond(
-                    output,
-                    id,
-                    None,
-                    Some(Failure {
-                        code: -32603,
-                        message: "clarification lock poisoned".into(),
-                    }),
-                );
-                return;
-            }
-        };
-        if state.active.is_some() {
+    let prompt = ClarifyPrompt {
+        id: prompt_id,
+        question: input.question,
+        options: input.options,
+    };
+    let pending = ClarifyPending {
+        id: prompt.id.clone(),
+        key: ClarifyKey {
+            turn: input.turn_id,
+            request: input.request_id,
+            call: input.call_id,
+        },
+        answer,
+    };
+    match shared.clarify.lock() {
+        Ok(mut state) => state.active = Some(pending),
+        Err(_) => {
+            close_sheet(&shared, &prompt.id);
             respond(
                 output,
                 id,
                 None,
                 Some(Failure {
-                    code: -32002,
-                    message: "another sheet is already open".into(),
+                    code: -32603,
+                    message: "clarification lock poisoned".into(),
                 }),
             );
             return;
         }
-        state.next += 1;
-        let prompt = ClarifyPrompt {
-            id: format!("clarify_{}", state.next),
-            question: input.question,
-            options: input.options,
-        };
-        state.active = Some(ClarifyPending {
-            id: prompt.id.clone(),
-            key: ClarifyKey {
-                turn: input.turn_id,
-                request: input.request_id,
-                call: input.call_id,
-            },
-            answer,
-        });
-        prompt
-    };
+    }
     if let Err(error) = emit_interaction(
         &shared,
         Interaction::ClarifyOpened {
@@ -758,14 +817,15 @@ fn cancel_clarify(shared: &Shared, params: Option<Value>) -> std::result::Result
     };
     if let Some(pending) = pending {
         let id = pending.id;
-        let _ = pending.answer.send(Err("clarification cancelled".into()));
         let _ = emit_interaction(
             shared,
             Interaction::ClarifyClosed {
-                id,
+                id: id.clone(),
                 error: Some("Clarification cancelled".into()),
             },
         );
+        close_sheet(shared, &id);
+        let _ = pending.answer.send(Err("clarification cancelled".into()));
     }
     Ok(serde_json::json!({"cancelled": true}))
 }
@@ -783,20 +843,18 @@ fn resolve_clarify(shared: &Shared, id: &str, answer: ClarifyAnswer) -> Result<(
     }
     .context("clarification is no longer active")?;
     let error = answer.as_ref().err().map(|value| sentence(value));
-    pending
-        .answer
-        .send(answer)
-        .map_err(|_| anyhow::anyhow!("clarification requester stopped waiting"))?;
     if let Err(error) = emit_interaction(
         shared,
         Interaction::ClarifyClosed {
-            id: pending.id,
+            id: pending.id.clone(),
             error,
         },
     ) {
         eprintln!("emit clarification close: {error}");
     }
-    Ok(())
+    close_sheet(shared, &pending.id);
+    let sent = pending.answer.send(answer);
+    sent.map_err(|_| anyhow::anyhow!("clarification requester stopped waiting"))
 }
 
 fn sentence(value: &str) -> String {
@@ -804,6 +862,33 @@ fn sentence(value: &str) -> String {
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
+    }
+}
+
+fn open_sheet(shared: &Shared, prefix: &str) -> std::result::Result<String, Failure> {
+    let mut sheet = shared.sheet.lock().map_err(|_| Failure {
+        code: -32603,
+        message: "interaction lock poisoned".into(),
+    })?;
+    if sheet.active.is_some() {
+        return Err(Failure {
+            code: -32002,
+            message: "another sheet is already open".into(),
+        });
+    }
+    sheet.next += 1;
+    let id = format!("{prefix}_{}", sheet.next);
+    sheet.active = Some(id.clone());
+    Ok(id)
+}
+
+fn close_sheet(shared: &Shared, id: &str) {
+    let mut sheet = match shared.sheet.lock() {
+        Ok(sheet) => sheet,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if sheet.active.as_deref() == Some(id) {
+        sheet.active = None;
     }
 }
 
@@ -816,6 +901,127 @@ fn emit_interaction(shared: &Shared, event: Interaction) -> std::result::Result<
         .ok_or_else(|| "interaction receiver is closed".to_string())?
         .send(event)
         .map_err(|_| "interaction receiver is closed".to_string())
+}
+
+struct GateFailure {
+    reason: find::Reason,
+    message: String,
+}
+
+fn gate(
+    shared: &Shared,
+    request: RuleRequest<'_>,
+    key: ApprovalKey,
+) -> std::result::Result<(), GateFailure> {
+    let ask = match shared.rules.decide(request) {
+        Decision::Allow => return Ok(()),
+        Decision::Deny(message) => {
+            return Err(GateFailure {
+                reason: find::Reason::Denied,
+                message,
+            })
+        }
+        Decision::Ask(ask) => ask,
+    };
+    let id = open_sheet(shared, "approval").map_err(|error| GateFailure {
+        reason: find::Reason::Busy,
+        message: error.message,
+    })?;
+    let prompt = ask.prompt(id.clone());
+    let (answer, received) = mpsc::sync_channel(1);
+    let pending = ApprovalPending {
+        id: id.clone(),
+        key,
+        ask,
+        answer,
+    };
+    match shared.approval.lock() {
+        Ok(mut state) => state.active = Some(pending),
+        Err(_) => {
+            close_sheet(shared, &id);
+            return Err(GateFailure {
+                reason: find::Reason::Busy,
+                message: "approval lock poisoned".into(),
+            });
+        }
+    }
+    if let Err(error) = emit_interaction(shared, Interaction::ApprovalOpened { prompt }) {
+        let _ = resolve_approval(shared, &id, Err(error.clone()));
+        return Err(GateFailure {
+            reason: find::Reason::Denied,
+            message: error,
+        });
+    }
+    match received.recv() {
+        Ok(Ok(ApprovalChoice::AllowOnce | ApprovalChoice::AllowSession)) => Ok(()),
+        Ok(Ok(ApprovalChoice::Deny)) | Ok(Err(_)) | Err(_) => Err(GateFailure {
+            reason: find::Reason::Denied,
+            message: "Approval denied".into(),
+        }),
+    }
+}
+
+fn resolve_approval(shared: &Shared, id: &str, answer: ApprovalAnswer) -> Result<()> {
+    let pending = {
+        let mut state = shared
+            .approval
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval lock poisoned"))?;
+        match state.active.as_ref().filter(|pending| pending.id == id) {
+            Some(_) => state.active.take(),
+            None => None,
+        }
+    }
+    .context("approval is no longer active")?;
+    let answer = match answer {
+        Ok(ApprovalChoice::AllowSession) => shared
+            .rules
+            .allow_session(&pending.ask)
+            .map(|_| ApprovalChoice::AllowSession)
+            .map_err(|error| error.to_string()),
+        other => other,
+    };
+    let error = answer.as_ref().err().map(|value| sentence(value));
+    if let Err(emit) = emit_interaction(
+        shared,
+        Interaction::ApprovalClosed {
+            id: pending.id.clone(),
+            error,
+        },
+    ) {
+        eprintln!("emit approval close: {emit}");
+    }
+    close_sheet(shared, &pending.id);
+    let sent = pending.answer.send(answer);
+    sent.map_err(|_| anyhow::anyhow!("approval requester stopped waiting"))
+}
+
+fn cancel_approval(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
+    let input: shell::Cancel =
+        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
+            code: -32602,
+            message: format!("decode approval cancellation: {error}"),
+        })?;
+    let key = ApprovalKey {
+        turn: input.turn_id,
+        request: input.request_id,
+        call: input.call_id,
+    };
+    let id = shared
+        .approval
+        .lock()
+        .map_err(|_| Failure {
+            code: -32603,
+            message: "approval lock poisoned".into(),
+        })?
+        .active
+        .as_ref()
+        .filter(|pending| pending.key == key)
+        .map(|pending| pending.id.clone());
+    if let Some(id) = id {
+        let _ = resolve_approval(shared, &id, Err("approval cancelled".into()));
+    }
+    Ok(serde_json::json!({"cancelled": true}))
 }
 
 #[derive(Deserialize)]
@@ -944,8 +1150,28 @@ fn write(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, F
         .proj
         .scope(input.task_id.as_deref())
         .map_err(internal_failure)?;
-    write::Key::new(input.turn_id, input.request_id).map_err(tool_failure)?;
-    serde_json::to_value(shared.reads.write(&scope, &input.path, input.content)).map_err(|error| {
+    write::Key::new(input.turn_id.clone(), input.request_id.clone()).map_err(tool_failure)?;
+    let path = write::policy_path(&scope, &input.path, false).map_err(tool_failure)?;
+    let detail = format!("{:016x}", write::sig(input.content.as_bytes()));
+    if let Err(error) = gate(
+        shared,
+        RuleRequest {
+            tool: rule::Tool::Write,
+            role: None,
+            command: None,
+            path: &path,
+            project: scope.root(),
+            detail: &detail,
+        },
+        ApprovalKey {
+            turn: input.turn_id.clone(),
+            request: input.request_id.clone(),
+            call: input.call_id.clone(),
+        },
+    ) {
+        return Ok(gated("write", error));
+    }
+    serde_json::to_value(shared.reads.write(&scope, &path, input.content)).map_err(|error| {
         Failure {
             code: -32603,
             message: format!("encode write result: {error}"),
@@ -963,11 +1189,37 @@ fn edit(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fa
         .proj
         .scope(input.task_id.as_deref())
         .map_err(internal_failure)?;
-    let key = write::Key::new(input.turn_id, input.request_id).map_err(tool_failure)?;
+    let key =
+        write::Key::new(input.turn_id.clone(), input.request_id.clone()).map_err(tool_failure)?;
+    let path = write::policy_path(&scope, &input.path, true).map_err(tool_failure)?;
+    let detail = format!(
+        "{:016x}:{:016x}:{}",
+        write::sig(input.target.as_bytes()),
+        write::sig(input.replacement.as_bytes()),
+        input.all
+    );
+    if let Err(error) = gate(
+        shared,
+        RuleRequest {
+            tool: rule::Tool::Edit,
+            role: None,
+            command: None,
+            path: &path,
+            project: scope.root(),
+            detail: &detail,
+        },
+        ApprovalKey {
+            turn: input.turn_id.clone(),
+            request: input.request_id.clone(),
+            call: input.call_id.clone(),
+        },
+    ) {
+        return Ok(gated("edit", error));
+    }
     serde_json::to_value(shared.reads.edit(
         &scope,
         key,
-        &input.path,
+        &path,
         &input.target,
         &input.replacement,
         input.all,
@@ -979,7 +1231,7 @@ fn edit(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fa
 }
 
 fn shell(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
-    let input: shell::Input =
+    let mut input: shell::Input =
         serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
             code: -32602,
             message: format!("decode shell request: {error}"),
@@ -988,10 +1240,41 @@ fn shell(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, F
         .proj
         .scope(input.task_id.as_deref())
         .map_err(internal_failure)?;
+    let cwd = shell::policy_cwd(&scope, &input).map_err(tool_failure)?;
+    if let Err(error) = gate(
+        shared,
+        RuleRequest {
+            tool: rule::Tool::Shell,
+            role: None,
+            command: Some(&input.command),
+            path: &cwd,
+            project: scope.root(),
+            detail: "",
+        },
+        ApprovalKey {
+            turn: input.turn_id.clone(),
+            request: input.request_id.clone(),
+            call: input.call_id.clone(),
+        },
+    ) {
+        return Ok(gated("shell", error));
+    }
+    input.cwd = Some(cwd);
     serde_json::to_value(shared.shells.run(&scope, input)).map_err(|error| Failure {
         code: -32603,
         message: format!("encode shell result: {error}"),
     })
+}
+
+fn gated(kind: &str, error: GateFailure) -> Value {
+    let error = serde_json::json!({"reason": error.reason, "message": error.message});
+    if kind == "shell" {
+        serde_json::json!({
+            "ok": false, "kind": kind, "stdout": "", "stderr": "", "error": error
+        })
+    } else {
+        serde_json::json!({"ok": false, "error": error})
+    }
 }
 
 fn cancel_shell(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
@@ -1111,10 +1394,27 @@ fn close_shared(shared: &Shared, error: &str) {
     };
     if let Some(pending) = clarify {
         let id = pending.id;
+        close_sheet(shared, &id);
         let _ = pending.answer.send(Err(error.into()));
         let _ = emit_interaction(
             shared,
             Interaction::ClarifyClosed {
+                id,
+                error: Some(sentence(error)),
+            },
+        );
+    }
+    let approval = match shared.approval.lock() {
+        Ok(mut state) => state.active.take(),
+        Err(poisoned) => poisoned.into_inner().active.take(),
+    };
+    if let Some(pending) = approval {
+        let id = pending.id;
+        close_sheet(shared, &id);
+        let _ = pending.answer.send(Err(error.into()));
+        let _ = emit_interaction(
+            shared,
+            Interaction::ApprovalClosed {
                 id,
                 error: Some(sentence(error)),
             },
@@ -1132,301 +1432,9 @@ fn close_shared(shared: &Shared, error: &str) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "rpc_policy_test.rs"]
+mod policy_tests;
 
-    fn shared(root: &Path) -> (Shared, mpsc::Receiver<Interaction>) {
-        let (notices, _notice_input) = mpsc::channel();
-        let (interactions, interaction_input) = mpsc::channel();
-        (
-            Shared {
-                pending: Mutex::new(Pending {
-                    waits: HashMap::new(),
-                    closed: false,
-                }),
-                notices: Mutex::new(Some(notices)),
-                interactions: Mutex::new(Some(interactions)),
-                clarify: Mutex::new(ClarifyState::default()),
-                key: Key,
-                proj: Arc::new(Proj::open(root.to_path_buf()).unwrap()),
-                reads: write::Reads::default(),
-                shells: shell::Shells::default(),
-            },
-            interaction_input,
-        )
-    }
-
-    #[test]
-    fn closing_connection_unblocks_pending_callers() {
-        let (answer, received) = mpsc::sync_channel(1);
-        let root =
-            std::env::temp_dir().join(format!("pippo-rpc-proj-{}-closing", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let (shared, interactions) = shared(&root);
-        shared.pending.lock().unwrap().waits.insert(7, answer);
-
-        close_shared(&shared, "stopped");
-        let error = received.recv().unwrap().unwrap_err();
-        assert_eq!(error, "stopped");
-        close_shared(&shared, "stopped again");
-        assert!(shared.pending.lock().unwrap().closed);
-        assert!(shared.notices.lock().unwrap().is_none());
-        assert!(shared.interactions.lock().unwrap().is_none());
-        assert!(interactions.try_recv().is_err());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn task_requests_reach_durable_project_state() {
-        let root = std::env::temp_dir().join(format!("pippo-rpc-proj-{}-task", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let work = root.join("work");
-        std::fs::create_dir_all(&work).unwrap();
-        let (shared, _interactions) = shared(&root);
-        let created = task(
-            &shared,
-            Some(serde_json::json!({
-                "action": "create", "title": "add upload retry", "path": work
-            })),
-        )
-        .unwrap();
-        let id = created["task_id"].as_str().unwrap();
-        assert!(id.starts_with("t_") && id.len() == 10);
-        let current = live(&shared, Some(serde_json::json!({}))).unwrap();
-        assert_eq!(current["task"]["id"], id);
-        assert_eq!(
-            current["project"]["path"],
-            std::fs::canonicalize(&work)
-                .unwrap()
-                .to_string_lossy()
-                .as_ref()
-        );
-        assert!(task(
-            &shared,
-            Some(serde_json::json!({
-                "action": "update", "id": id, "status": "done", "note": "verified"
-            }))
-        )
-        .is_ok());
-        drop(shared);
-        assert!(Proj::open(root.clone()).is_ok());
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn find_requests_use_the_active_task_scope() {
-        let root = std::env::temp_dir().join(format!("pippo-rpc-proj-{}-find", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let work = root.join("work");
-        std::fs::create_dir_all(work.join("src")).unwrap();
-        std::fs::write(work.join("src/main.rs"), b"first\nneedle\nlast\n").unwrap();
-        let (shared, _interactions) = shared(&root);
-        task(
-            &shared,
-            Some(serde_json::json!({
-                "action": "create", "title": "search project text", "path": work.clone()
-            })),
-        )
-        .unwrap();
-        let result = find(
-            &shared,
-            Some(serde_json::json!({
-                "turn_id": "run-a", "request_id": "request-a",
-                "query": "needle", "in": "content", "context": 1
-            })),
-        )
-        .unwrap();
-        assert_eq!(result["ok"], true);
-        assert_eq!(result["kind"], "search");
-        assert_eq!(result["hits"][0]["path"], "src/main.rs");
-        assert_eq!(result["hits"][0]["line"], 2);
-        assert_eq!(result["hits"][0]["context"].as_array().unwrap().len(), 3);
-        let denied = edit(
-            &shared,
-            Some(serde_json::json!({
-                "turn_id": "run-b", "request_id": "request-a", "path": "src/main.rs",
-                "target": "needle", "replacement": "changed"
-            })),
-        )
-        .unwrap();
-        assert_eq!(denied["error"]["reason"], "denied");
-        let edited = edit(
-            &shared,
-            Some(serde_json::json!({
-                "turn_id": "run-a", "request_id": "request-a", "path": "src/main.rs",
-                "target": "needle", "replacement": "changed"
-            })),
-        )
-        .unwrap();
-        assert_eq!(edited["ok"], true);
-        assert_eq!(edited["replacements"], 1);
-        assert_eq!(
-            std::fs::read_to_string(work.join("src/main.rs")).unwrap(),
-            "first\nchanged\nlast\n"
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn shell_requests_execute_in_the_active_task_scope() {
-        let root =
-            std::env::temp_dir().join(format!("pippo-rpc-proj-{}-shell", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let work = root.join("work");
-        std::fs::create_dir_all(&work).unwrap();
-        let (shared, _interactions) = shared(&root);
-        task(
-            &shared,
-            Some(serde_json::json!({
-                "action": "create", "title": "run project command", "path": work.clone()
-            })),
-        )
-        .unwrap();
-        let result = shell(
-            &shared,
-            Some(serde_json::json!({
-                "turn_id": "run-a", "request_id": "request-a", "call_id": "shell-a",
-                "command": "printf '%s' \"$PWD\"", "env": {"RPC_VALUE": "present"}
-            })),
-        )
-        .unwrap();
-        assert_eq!(result["ok"], true);
-        assert_eq!(result["kind"], "shell");
-        assert_eq!(result["exit_code"], 0);
-        assert_eq!(
-            result["stdout"],
-            std::fs::canonicalize(&work)
-                .unwrap()
-                .to_string_lossy()
-                .as_ref()
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn clarification_answer_is_correlated_and_only_accepted_once() {
-        let root =
-            std::env::temp_dir().join(format!("pippo-rpc-proj-{}-clarify", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let (shared, interactions) = shared(&root);
-        let shared = Arc::new(shared);
-        let (output, mut responses) = async_mpsc::unbounded_channel();
-        start_clarify(
-            Arc::clone(&shared),
-            output,
-            Some(9),
-            Some(serde_json::json!({
-                "turn_id": "turn-a",
-                "request_id": "request-a",
-                "call_id": "call-a",
-                "question": "Which failures should retry?",
-                "options": [
-                    {"label": "Transient failures", "recommended": true},
-                    {"label": "All failures"}
-                ]
-            })),
-        );
-        let prompt = match interactions.recv().unwrap() {
-            Interaction::ClarifyOpened { prompt } => prompt,
-            event => panic!("unexpected event: {event:?}"),
-        };
-        assert_eq!(
-            prompt
-                .options
-                .iter()
-                .filter(|option| option.recommended)
-                .count(),
-            1
-        );
-        resolve_clarify(&shared, &prompt.id, Ok("Transient failures".into())).unwrap();
-        assert!(resolve_clarify(&shared, &prompt.id, Ok("All failures".into())).is_err());
-        assert!(matches!(
-            interactions.recv().unwrap(),
-            Interaction::ClarifyClosed { error: None, .. }
-        ));
-        let Command::Message(text) = responses.blocking_recv().unwrap() else {
-            panic!("clarification response closed the socket")
-        };
-        let response: Wire = serde_json::from_str(&text).unwrap();
-        assert_eq!(response.id, Some(9));
-        assert_eq!(response.result.unwrap()["answer"], "Transient failures");
-        close_shared(&shared, "stopped");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn clarification_disconnect_unblocks_waiter() {
-        let root = std::env::temp_dir().join(format!(
-            "pippo-rpc-proj-{}-clarify-close",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let (shared, interactions) = shared(&root);
-        let (answer, received) = mpsc::sync_channel(1);
-        shared.clarify.lock().unwrap().active = Some(ClarifyPending {
-            id: "clarify-test".into(),
-            key: ClarifyKey {
-                turn: "turn-a".into(),
-                request: "request-a".into(),
-                call: "call-a".into(),
-            },
-            answer,
-        });
-        close_shared(&shared, "connection lost");
-        assert_eq!(received.recv().unwrap().unwrap_err(), "connection lost");
-        assert!(matches!(
-            interactions.recv().unwrap(),
-            Interaction::ClarifyClosed {
-                error: Some(error),
-                ..
-            } if error == "Connection lost"
-        ));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn clarification_cancel_matches_the_originating_call() {
-        let root = std::env::temp_dir().join(format!(
-            "pippo-rpc-proj-{}-clarify-cancel",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let (shared, interactions) = shared(&root);
-        let (answer, received) = mpsc::sync_channel(1);
-        shared.clarify.lock().unwrap().active = Some(ClarifyPending {
-            id: "clarify-test".into(),
-            key: ClarifyKey {
-                turn: "turn-a".into(),
-                request: "request-a".into(),
-                call: "call-a".into(),
-            },
-            answer,
-        });
-        let input = |turn: &str| {
-            Some(serde_json::json!({
-                "turn_id": turn,
-                "request_id": "request-a",
-                "call_id": "call-a",
-                "question": "Continue?"
-            }))
-        };
-        cancel_clarify(&shared, input("turn-b")).unwrap();
-        assert!(shared.clarify.lock().unwrap().active.is_some());
-        assert!(received.try_recv().is_err());
-        cancel_clarify(&shared, input("turn-a")).unwrap();
-        assert_eq!(
-            received.recv().unwrap().unwrap_err(),
-            "clarification cancelled"
-        );
-        assert!(shared.clarify.lock().unwrap().active.is_none());
-        assert!(matches!(
-            interactions.recv().unwrap(),
-            Interaction::ClarifyClosed {
-                error: Some(error),
-                ..
-            } if error == "Clarification cancelled"
-        ));
-        close_shared(&shared, "stopped");
-        std::fs::remove_dir_all(root).unwrap();
-    }
-}
+#[cfg(test)]
+#[path = "rpc_test.rs"]
+mod tests;

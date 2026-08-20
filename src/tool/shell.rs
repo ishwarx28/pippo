@@ -260,6 +260,13 @@ fn validate(
     Ok((cwd, Duration::from_secs(seconds)))
 }
 
+pub(crate) fn policy_cwd(
+    scope: &Scope,
+    input: &Input,
+) -> std::result::Result<PathBuf, find::Failure> {
+    validate(scope, input).map(|value| value.0)
+}
+
 fn terminate(child: &mut Child, pgid: i32) {
     signal(pgid, libc::SIGTERM);
     let deadline = Instant::now() + KILL_GRACE;

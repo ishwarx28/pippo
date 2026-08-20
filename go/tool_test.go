@@ -161,6 +161,7 @@ func TestShellCancellationNotifiesTheRuntime(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	cancelled := make(chan shellCancel, 1)
+	approvalCancelled := make(chan shellCancel, 1)
 	var once sync.Once
 	client := dialRPCWith(t, server.URL, validToken, map[string]handler{
 		"runtime.shell": func(_ context.Context, _ *rpc, _ json.RawMessage) (any, error) {
@@ -175,6 +176,14 @@ func TestShellCancellationNotifiesTheRuntime(t *testing.T) {
 			}
 			cancelled <- input
 			close(release)
+			return map[string]bool{"cancelled": true}, nil
+		},
+		"runtime.approval.cancel": func(_ context.Context, _ *rpc, raw json.RawMessage) (any, error) {
+			var input shellCancel
+			if err := json.Unmarshal(raw, &input); err != nil {
+				return nil, err
+			}
+			approvalCancelled <- input
 			return map[string]bool{"cancelled": true}, nil
 		},
 	})
@@ -194,8 +203,12 @@ func TestShellCancellationNotifiesTheRuntime(t *testing.T) {
 	cancel()
 	result := <-done
 	input := <-cancelled
+	approval := <-approvalCancelled
 	if input.Turn != "run-cancel" || input.Request != "request-cancel" || input.CallID != "shell-cancel" {
 		t.Fatalf("shell cancellation = %#v", input)
+	}
+	if approval != input {
+		t.Fatalf("approval cancellation = %#v", approval)
 	}
 	if !strings.Contains(result.Data["error"].(string), "context canceled") {
 		t.Fatalf("cancelled result = %#v", result)
@@ -267,7 +280,8 @@ func TestFindDispatchesToRuntimeWithoutJoiningOrchestratorTools(t *testing.T) {
 		ID: "write-1", Name: "write", Args: map[string]any{"path": "new.txt", "content": content},
 	})
 	write := <-writes
-	if write.Turn != "run-a" || write.Request != "request-a" || write.TaskID != "t_1234abcd" ||
+	if write.Turn != "run-a" || write.Request != "request-a" || write.CallID != "write-1" ||
+		write.TaskID != "t_1234abcd" ||
 		write.Path != "new.txt" || write.Content == nil || *write.Content != content {
 		t.Fatalf("write request = %#v", write)
 	}
@@ -281,7 +295,7 @@ func TestFindDispatchesToRuntimeWithoutJoiningOrchestratorTools(t *testing.T) {
 		},
 	})
 	edit := <-edits
-	if edit.Turn != "run-a" || edit.Request != "request-a" || edit.Target != "old" ||
+	if edit.Turn != "run-a" || edit.Request != "request-a" || edit.CallID != "edit-1" || edit.Target != "old" ||
 		edit.Replacement == nil || *edit.Replacement != replacement {
 		t.Fatalf("edit request = %#v", edit)
 	}

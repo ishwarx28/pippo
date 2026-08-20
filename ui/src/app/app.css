@@ -164,6 +164,35 @@
   justify-content: flex-end;
 }
 
+.approval__details {
+  display: grid;
+  grid-template-columns: auto minmax(var(--r), var(--fill));
+  gap: var(--s2) var(--s3);
+  margin: var(--r) var(--r) var(--s4);
+}
+
+.approval__details dt {
+  color: var(--dim);
+  font: 500 var(--t-sm) var(--sans);
+}
+
+.approval__details dd {
+  min-width: var(--r);
+  margin: var(--r);
+  overflow-wrap: anywhere;
+}
+
+.approval__details code {
+  font: 400 var(--t-code) var(--mono);
+}
+
+.approval__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--s2);
+}
+
 @keyframes pulse {
   from {
     opacity: var(--pending-opacity);

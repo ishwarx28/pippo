@@ -85,6 +85,20 @@ pub fn cancel_clarify(rpc: State<'_, Rpc>, id: String) -> std::result::Result<()
     rpc.cancel_clarify(&id).map_err(message)
 }
 
+#[tauri::command]
+pub fn answer_approval(
+    rpc: State<'_, Rpc>,
+    id: String,
+    choice: crate::rpc::ApprovalChoice,
+) -> std::result::Result<(), String> {
+    rpc.answer_approval(&id, choice).map_err(message)
+}
+
+#[tauri::command]
+pub fn cancel_approval(rpc: State<'_, Rpc>, id: String) -> std::result::Result<(), String> {
+    rpc.cancel_approval(&id).map_err(message)
+}
+
 pub fn listen(
     app: AppHandle,
     sess: Arc<Sess>,

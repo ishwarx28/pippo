@@ -189,12 +189,14 @@ type editArgs struct {
 
 type writeRequest struct {
 	callID
+	CallID string `json:"call_id"`
 	TaskID string `json:"task_id,omitempty"`
 	writeArgs
 }
 
 type editRequest struct {
 	callID
+	CallID string `json:"call_id"`
 	TaskID string `json:"task_id,omitempty"`
 	editArgs
 }
@@ -295,7 +297,11 @@ func execTool(ctx context.Context, peer *rpc, id callID, taskID string, call mod
 			return result
 		}
 		var output map[string]any
-		if err := peer.call(ctx, "runtime.write", writeRequest{callID: id, TaskID: taskID, writeArgs: args}, &output); err != nil {
+		input := writeRequest{callID: id, CallID: call.ID, TaskID: taskID, writeArgs: args}
+		if err := peer.call(ctx, "runtime.write", input, &output); err != nil {
+			if ctx.Err() != nil {
+				_ = peer.notify("runtime.approval.cancel", shellCancel{callID: id, CallID: call.ID})
+			}
 			result.Data = map[string]any{"error": err.Error()}
 		} else {
 			result.Data = output
@@ -307,7 +313,11 @@ func execTool(ctx context.Context, peer *rpc, id callID, taskID string, call mod
 			return result
 		}
 		var output map[string]any
-		if err := peer.call(ctx, "runtime.edit", editRequest{callID: id, TaskID: taskID, editArgs: args}, &output); err != nil {
+		input := editRequest{callID: id, CallID: call.ID, TaskID: taskID, editArgs: args}
+		if err := peer.call(ctx, "runtime.edit", input, &output); err != nil {
+			if ctx.Err() != nil {
+				_ = peer.notify("runtime.approval.cancel", shellCancel{callID: id, CallID: call.ID})
+			}
 			result.Data = map[string]any{"error": err.Error()}
 		} else {
 			result.Data = output
@@ -323,6 +333,7 @@ func execTool(ctx context.Context, peer *rpc, id callID, taskID string, call mod
 		if err := peer.call(ctx, "runtime.shell", input, &output); err != nil {
 			if ctx.Err() != nil {
 				_ = peer.notify("runtime.shell.cancel", shellCancel{callID: id, CallID: call.ID})
+				_ = peer.notify("runtime.approval.cancel", shellCancel{callID: id, CallID: call.ID})
 			}
 			result.Data = map[string]any{"error": err.Error()}
 		} else {

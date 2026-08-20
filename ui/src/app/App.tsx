@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { useEffect, useReducer, useRef, useState } from "react";
 import { Composer } from "./Composer";
 import { ClarifySheet, type ClarifyPrompt } from "./ClarifySheet";
+import { ApprovalSheet, type ApprovalPrompt } from "./ApprovalSheet";
 import { Header } from "./Header";
 import { MessageView } from "./Message";
 import { ModelKeyCard } from "./ModelKeyCard";
@@ -52,7 +53,9 @@ type KeyStatus = "missing" | "stored";
 type MessageAction = TurnEvent | { kind: "hydrate"; messages: Message[] };
 type InteractionEvent =
   | { kind: "clarify_opened"; prompt: ClarifyPrompt }
-  | { kind: "clarify_closed"; id: string; error?: string };
+  | { kind: "clarify_closed"; id: string; error?: string }
+  | { kind: "approval_opened"; prompt: ApprovalPrompt }
+  | { kind: "approval_closed"; id: string; error?: string };
 
 function applyEvent(messages: Message[], event: MessageAction): Message[] {
   if (event.kind === "hydrate") {
@@ -95,6 +98,8 @@ export function App() {
   const [clarify, setClarify] = useState<ClarifyPrompt>();
   const [clarifyDraft, setClarifyDraft] = useState("");
   const [clarifyBusy, setClarifyBusy] = useState(false);
+  const [approval, setApproval] = useState<ApprovalPrompt>();
+  const [approvalBusy, setApprovalBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [announcement, setAnnouncement] = useState("");
   const opened = useRef(0);
@@ -157,7 +162,7 @@ export function App() {
             setClarifyDraft("");
             setClarifyBusy(false);
             setAnnouncement("Question needs your answer");
-          } else {
+          } else if (payload.kind === "clarify_closed") {
             setClarify((current) => (current?.id === payload.id ? undefined : current));
             setClarifyDraft("");
             setClarifyBusy(false);
@@ -165,6 +170,14 @@ export function App() {
               setError(payload.error);
               setAnnouncement(payload.error);
             }
+          } else if (payload.kind === "approval_opened") {
+            setApproval(payload.prompt);
+            setApprovalBusy(false);
+            setAnnouncement("Action needs your approval");
+          } else {
+            setApproval((current) => (current?.id === payload.id ? undefined : current));
+            setApprovalBusy(false);
+            if (payload.error) setAnnouncement(payload.error);
           }
         });
         if (!active) {
@@ -286,6 +299,30 @@ export function App() {
     }
   }
 
+  async function answerApproval(choice: "allow_once" | "allow_session" | "deny") {
+    if (!approval || approvalBusy) return;
+    setApprovalBusy(true);
+    setError(undefined);
+    try {
+      await invoke("answer_approval", { id: approval.id, choice });
+      setAnnouncement(choice === "deny" ? "Action denied" : "Action approved");
+    } catch (reason) {
+      setApprovalBusy(false);
+      setError(`Could not answer the approval: ${detail(reason)}`);
+    }
+  }
+
+  async function cancelApproval() {
+    if (!approval || approvalBusy) return;
+    setApprovalBusy(true);
+    try {
+      await invoke("cancel_approval", { id: approval.id });
+    } catch (reason) {
+      setApprovalBusy(false);
+      setError(`Could not deny the action: ${detail(reason)}`);
+    }
+  }
+
   return (
     <main className="shell">
       <Header running={running} />
@@ -338,6 +375,14 @@ export function App() {
           onChange={setClarifyDraft}
           onAnswer={(answer) => void answerClarify(answer)}
           onCancel={() => void cancelClarify()}
+        />
+      )}
+      {approval && (
+        <ApprovalSheet
+          prompt={approval}
+          busy={approvalBusy}
+          onChoose={(choice) => void answerApproval(choice)}
+          onCancel={() => void cancelApproval()}
         />
       )}
       <p className="sr-only" aria-live="polite" aria-atomic="true">
