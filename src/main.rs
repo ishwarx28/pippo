@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod cfg;
+mod rpc;
 mod store;
 
 use anyhow::{Context, Result};
@@ -19,13 +20,17 @@ const CHILD_PATH: &str = env!("PIPPO_PIPPOD_PATH");
 const START_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub struct Service {
-    pub addr: SocketAddr,
-    pub token: String,
     child: Mutex<Child>,
 }
 
+struct Spawned {
+    service: Service,
+    addr: SocketAddr,
+    token: String,
+}
+
 impl Service {
-    fn spawn() -> Result<Self> {
+    fn spawn() -> Result<Spawned> {
         let token = token()?;
         let mut child = Command::new(CHILD_PATH)
             .args(["--listen", "127.0.0.1:0"])
@@ -51,8 +56,6 @@ impl Service {
             }
         });
         let mut service = Self {
-            addr: "127.0.0.1:0".parse().context("parse loopback address")?,
-            token,
             child: Mutex::new(child),
         };
         let line = received
@@ -62,8 +65,8 @@ impl Service {
         reader
             .join()
             .map_err(|_| anyhow::anyhow!("child readiness reader panicked"))?;
-        service.addr = line.trim().parse().context("parse child process address")?;
-        if !matches!(service.addr.ip(), IpAddr::V4(ip) if ip.is_loopback()) {
+        let addr: SocketAddr = line.trim().parse().context("parse child process address")?;
+        if !matches!(addr.ip(), IpAddr::V4(ip) if ip.is_loopback()) {
             anyhow::bail!("child process did not bind IPv4 loopback");
         }
         if let Some(status) = service
@@ -73,7 +76,11 @@ impl Service {
         {
             anyhow::bail!("child process exited during startup with {status}");
         }
-        Ok(service)
+        Ok(Spawned {
+            service,
+            addr,
+            token,
+        })
     }
 
     fn stop(&mut self) -> Result<()> {
@@ -118,12 +125,14 @@ fn main() {
 fn run() -> Result<()> {
     let root = cfg::root()?;
     let cfg = cfg::load_at(root.clone())?;
-    let store = store::Store::open(root)?;
-    let service = Service::spawn()?;
+    let store = store::Store::open(root.clone())?;
+    let spawned = Service::spawn()?;
+    let rpc = rpc::Rpc::connect(spawned.addr, spawned.token, &rpc::Hello::new(&root, &cfg)?)?;
     tauri::Builder::default()
         .manage(cfg)
         .manage(store)
-        .manage(service)
+        .manage(rpc)
+        .manage(spawned.service)
         .run(tauri::generate_context!())
         .map_err(Into::into)
 }
@@ -131,10 +140,7 @@ fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        io::Read,
-        net::{Ipv4Addr, TcpStream},
-    };
+    use std::net::{Ipv4Addr, TcpStream};
 
     #[test]
     fn tokens_are_random_hex() {
@@ -146,28 +152,31 @@ mod tests {
     }
 
     #[test]
-    fn child_binds_loopback_and_accepts_token_once() {
-        let mut service = Service::spawn().unwrap();
-        assert_eq!(service.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    fn child_rpc_is_authenticated_and_concurrent() {
+        let spawned = Service::spawn().unwrap();
+        assert_eq!(spawned.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let hello = rpc::Hello::new(&std::env::temp_dir(), &cfg::Config::default()).unwrap();
+        let rpc = rpc::Rpc::connect(spawned.addr, spawned.token.clone(), &hello).unwrap();
+        assert!(rpc::Rpc::connect(spawned.addr, spawned.token, &hello).is_err());
 
-        assert!(request(&service, &service.token).starts_with("HTTP/1.0 426"));
-        assert!(request(&service, &service.token).starts_with("HTTP/1.0 401"));
+        thread::scope(|scope| {
+            let calls: Vec<_> = (0..16)
+                .map(|_| {
+                    let rpc = rpc.clone();
+                    scope.spawn(move || {
+                        let ready: serde_json::Value = rpc.call("health", &()).unwrap();
+                        assert_eq!(ready["ready"], true);
+                    })
+                })
+                .collect();
+            for call in calls {
+                call.join().unwrap();
+            }
+        });
+        drop(rpc);
+        let addr = spawned.addr;
+        let mut service = spawned.service;
         service.stop().unwrap();
-        assert!(TcpStream::connect_timeout(&service.addr, Duration::from_millis(100)).is_err());
-    }
-
-    fn request(service: &Service, token: &str) -> String {
-        let mut stream = TcpStream::connect(service.addr).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        write!(
-            stream,
-            "POST /rpc HTTP/1.0\r\nAuthorization: Bearer {token}\r\n\r\n"
-        )
-        .unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).unwrap();
-        response
+        assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_err());
     }
 }

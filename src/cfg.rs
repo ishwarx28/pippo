@@ -246,13 +246,12 @@ fn write_json<T: Serialize>(path: &PathBuf, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
 
     fn root() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
         env::temp_dir().join(format!("pippo-cfg-{}-{nonce}", std::process::id()))
     }
 

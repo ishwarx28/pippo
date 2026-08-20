@@ -8,6 +8,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/gorilla/websocket"
 )
 
 const validToken = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -26,25 +28,30 @@ func TestTokenIsClaimedOnce(t *testing.T) {
 	}
 }
 
-func TestRoutesAuthenticateBeforeUpgrade(t *testing.T) {
+func TestWebsocketAuthenticatesOnlyOnce(t *testing.T) {
 	token, err := readToken(strings.NewReader(validToken + "\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	handler := routes(&auth{token: token})
-
-	request := httptest.NewRequest(http.MethodPost, "/rpc", nil)
-	request.Header.Set("Authorization", "Bearer "+validToken)
-	response := httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusUpgradeRequired {
-		t.Fatalf("status = %d", response.Code)
+	server := httptest.NewServer(routes(&auth{token: token}, &state{}))
+	defer server.Close()
+	header := http.Header{"Authorization": []string{"Bearer " + validToken}}
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server.URL), header)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	response = httptest.NewRecorder()
-	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusUnauthorized {
-		t.Fatalf("second status = %d", response.Code)
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, response, err := websocket.DefaultDialer.Dial(wsURL(server.URL), header)
+	if err == nil {
+		t.Fatal("startup token was accepted twice")
+	}
+	if response == nil || response.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("second response = %#v", response)
+	}
+	if err := response.Body.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -61,4 +68,8 @@ func TestReadTokenRejectsMalformedInput(t *testing.T) {
 			t.Fatalf("accepted %q", input)
 		}
 	}
+}
+
+func wsURL(address string) string {
+	return "ws" + strings.TrimPrefix(address, "http") + "/rpc"
 }

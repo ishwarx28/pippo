@@ -59,8 +59,7 @@ func run(args []string, stdin io.Reader, ready io.Writer) (result error) {
 		}
 	}()
 
-	guard := &auth{token: token}
-	server := &http.Server{Handler: routes(guard)}
+	server := server(&auth{token: token})
 	if _, err := fmt.Fprintln(ready, listener.Addr().String()); err != nil {
 		return fmt.Errorf("report listen address: %w", err)
 	}
@@ -80,23 +79,6 @@ func readToken(input io.Reader) ([]byte, error) {
 		return nil, errors.New("startup token must be 32 bytes of hex")
 	}
 	return token, nil
-}
-
-func routes(guard *auth) http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/rpc", func(response http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPost {
-			response.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		value := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
-		if !guard.claim(value) {
-			response.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		response.WriteHeader(http.StatusUpgradeRequired)
-	})
-	return mux
 }
 
 func (guard *auth) claim(value string) bool {

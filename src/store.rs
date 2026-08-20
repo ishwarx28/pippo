@@ -142,7 +142,9 @@ impl Store {
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
 
     #[derive(Debug, Deserialize, PartialEq, Serialize)]
     struct Message {
@@ -151,10 +153,7 @@ mod tests {
     }
 
     fn root() -> PathBuf {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("pippo-store-{}-{nonce}", std::process::id()))
     }
 
