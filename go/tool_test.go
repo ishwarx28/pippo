@@ -54,6 +54,24 @@ func TestFindValidatesSearchAndReadShapes(t *testing.T) {
 	}
 }
 
+func TestWriteAndEditRequireFlatCompleteArguments(t *testing.T) {
+	empty := ""
+	content := "new text"
+	if checkWrite(writeArgs{Path: "file.txt", Content: &empty}) != nil {
+		t.Fatal("write rejected empty content")
+	}
+	if checkWrite(writeArgs{Path: "file.txt"}) == nil || checkWrite(writeArgs{Content: &content}) == nil {
+		t.Fatal("write accepted incomplete arguments")
+	}
+	if checkEdit(editArgs{Path: "file.txt", Target: "old", Replacement: &empty}) != nil {
+		t.Fatal("edit rejected an empty replacement")
+	}
+	if checkEdit(editArgs{Path: "file.txt", Replacement: &content}) == nil ||
+		checkEdit(editArgs{Target: "old", Replacement: &content}) == nil {
+		t.Fatal("edit accepted incomplete arguments")
+	}
+}
+
 func TestFindDispatchesToRuntimeWithoutJoiningOrchestratorTools(t *testing.T) {
 	if findTool.Name != "find" {
 		t.Fatalf("find declaration = %#v", findTool)
@@ -67,6 +85,8 @@ func TestFindDispatchesToRuntimeWithoutJoiningOrchestratorTools(t *testing.T) {
 	server := httptest.NewServer(routes(&auth{token: token}, state))
 	defer server.Close()
 	requests := make(chan findRequest, 1)
+	writes := make(chan writeRequest, 1)
+	edits := make(chan editRequest, 1)
 	client := dialRPCWith(t, server.URL, validToken, map[string]handler{
 		"runtime.find": func(_ context.Context, _ *rpc, raw json.RawMessage) (any, error) {
 			var input findRequest
@@ -79,20 +99,63 @@ func TestFindDispatchesToRuntimeWithoutJoiningOrchestratorTools(t *testing.T) {
 				"hits": []any{map[string]any{"path": "src/main.rs", "line": 7}},
 			}, nil
 		},
+		"runtime.write": func(_ context.Context, _ *rpc, raw json.RawMessage) (any, error) {
+			var input writeRequest
+			if err := json.Unmarshal(raw, &input); err != nil {
+				return nil, err
+			}
+			writes <- input
+			return map[string]any{"ok": true, "kind": "write", "created": true}, nil
+		},
+		"runtime.edit": func(_ context.Context, _ *rpc, raw json.RawMessage) (any, error) {
+			var input editRequest
+			if err := json.Unmarshal(raw, &input); err != nil {
+				return nil, err
+			}
+			edits <- input
+			return map[string]any{"ok": true, "kind": "edit", "replacements": 1}, nil
+		},
 	})
 	defer client.close()
 	peer := state.connection()
 	if peer == nil {
 		t.Fatal("runtime connection was not attached")
 	}
-	result := execTool(context.Background(), peer, callID{}, "t_1234abcd", model.Call{
+	result := execTool(context.Background(), peer, callID{Turn: "run-a", Request: "request-a"}, "t_1234abcd", model.Call{
 		ID: "find-1", Name: "find", Args: map[string]any{"query": "needle", "in": "content"},
 	})
 	request := <-requests
-	if request.TaskID != "t_1234abcd" || request.Query != "needle" || request.In != "content" {
+	if request.Turn != "run-a" || request.Request != "request-a" || request.TaskID != "t_1234abcd" ||
+		request.Query != "needle" || request.In != "content" {
 		t.Fatalf("runtime request = %#v", request)
 	}
 	if ok, _ := result.Data["ok"].(bool); !ok || result.Name != "find" {
 		t.Fatalf("tool result = %#v", result)
+	}
+	content := "new\n"
+	result = execTool(context.Background(), peer, callID{Turn: "run-a", Request: "request-a"}, "t_1234abcd", model.Call{
+		ID: "write-1", Name: "write", Args: map[string]any{"path": "new.txt", "content": content},
+	})
+	write := <-writes
+	if write.Turn != "run-a" || write.Request != "request-a" || write.TaskID != "t_1234abcd" ||
+		write.Path != "new.txt" || write.Content == nil || *write.Content != content {
+		t.Fatalf("write request = %#v", write)
+	}
+	if ok, _ := result.Data["ok"].(bool); !ok {
+		t.Fatalf("write result = %#v", result)
+	}
+	replacement := "new"
+	result = execTool(context.Background(), peer, callID{Turn: "run-a", Request: "request-a"}, "t_1234abcd", model.Call{
+		ID: "edit-1", Name: "edit", Args: map[string]any{
+			"path": "new.txt", "target": "old", "replacement": replacement,
+		},
+	})
+	edit := <-edits
+	if edit.Turn != "run-a" || edit.Request != "request-a" || edit.Target != "old" ||
+		edit.Replacement == nil || *edit.Replacement != replacement {
+		t.Fatalf("edit request = %#v", edit)
+	}
+	if ok, _ := result.Data["ok"].(bool); !ok {
+		t.Fatalf("edit result = %#v", result)
 	}
 }

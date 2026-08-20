@@ -1,6 +1,9 @@
 // Owns bounded text search and reads under a run's project-relative scope.
 
-use crate::proj::Scope;
+use crate::{
+    proj::Scope,
+    tool::write::{self, Mark},
+};
 use ignore::WalkBuilder;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -30,6 +33,8 @@ const IGNORED_DIRS: &[&str] = &[
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Input {
+    pub turn_id: Option<String>,
+    pub request_id: Option<String>,
     pub task_id: Option<String>,
     pub query: Option<String>,
     #[serde(default)]
@@ -93,6 +98,8 @@ pub struct Hit {
     pub total_lines: usize,
     pub source: &'static str,
     pub context: Vec<Line>,
+    #[serde(skip)]
+    mark: Option<Mark>,
 }
 
 #[derive(Debug, Serialize)]
@@ -109,9 +116,11 @@ pub struct Failure {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_lines: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matches: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reason {
     NotFound,
@@ -121,20 +130,31 @@ pub enum Reason {
     Busy,
 }
 
-pub fn run(scope: &Scope, input: Input) -> Result {
+pub struct Outcome {
+    pub result: Result,
+    pub reads: Vec<Mark>,
+}
+
+pub fn run(scope: &Scope, input: Input) -> Outcome {
     match validate(scope, input).and_then(|op| match op {
         Op::Search(args) => search(scope, args),
         Op::Read(args) => read(scope, args),
     }) {
-        Ok(value) => Result {
-            ok: true,
-            value: Some(value),
-            error: None,
+        Ok((value, reads)) => Outcome {
+            result: Result {
+                ok: true,
+                value: Some(value),
+                error: None,
+            },
+            reads,
         },
-        Err(error) => Result {
-            ok: false,
-            value: None,
-            error: Some(error),
+        Err(error) => Outcome {
+            result: Result {
+                ok: false,
+                value: None,
+                error: Some(error),
+            },
+            reads: Vec::new(),
         },
     }
 }
@@ -203,7 +223,7 @@ fn validate(scope: &Scope, input: Input) -> std::result::Result<Op, Failure> {
     }
 }
 
-fn search(scope: &Scope, args: Search) -> std::result::Result<Value, Failure> {
+fn search(scope: &Scope, args: Search) -> std::result::Result<(Value, Vec<Mark>), Failure> {
     guard(&args.root)?;
     let meta = fs::metadata(&args.root).map_err(io_failure)?;
     let mut hits = Vec::new();
@@ -232,6 +252,7 @@ fn search(scope: &Scope, args: Search) -> std::result::Result<Value, Failure> {
                 reason: Reason::Busy,
                 message: error.to_string(),
                 total_lines: None,
+                matches: None,
             })?;
             if entry.depth() == 0 || denied(entry.path()) {
                 continue;
@@ -252,12 +273,16 @@ fn search(scope: &Scope, args: Search) -> std::result::Result<Value, Failure> {
         .skip(args.offset)
         .take(args.cap)
         .collect::<Vec<_>>();
+    let reads = page.iter().filter_map(|hit| hit.mark.clone()).collect();
     let next_offset = more.then_some(args.offset + page.len());
-    Ok(Value::Search {
-        hits: page,
-        offset: args.offset,
-        next_offset,
-    })
+    Ok((
+        Value::Search {
+            hits: page,
+            offset: args.offset,
+            next_offset,
+        },
+        reads,
+    ))
 }
 
 fn collect(
@@ -283,6 +308,7 @@ fn collect(
                 total_lines: count_lines(path)?,
                 source: "path",
                 context: Vec::new(),
+                mark: None,
             });
         }
         return Ok(());
@@ -296,6 +322,7 @@ fn collect(
             total_lines: total,
             source: "path",
             context: Vec::new(),
+            mark: None,
         });
         if hits.len() >= needed {
             return Ok(());
@@ -308,6 +335,10 @@ fn collect(
         return Ok(());
     };
     let lines = text.lines().collect::<Vec<_>>();
+    let mark = Mark {
+        path: fs::canonicalize(path).map_err(io_failure)?,
+        sig: write::sig(&bytes),
+    };
     for (index, line) in lines.iter().enumerate() {
         if !matched(args, line) {
             continue;
@@ -328,6 +359,7 @@ fn collect(
                     matched: start + at == index,
                 })
                 .collect(),
+            mark: Some(mark.clone()),
         });
         if hits.len() >= needed {
             break;
@@ -336,7 +368,7 @@ fn collect(
     Ok(())
 }
 
-fn read(scope: &Scope, args: Read) -> std::result::Result<Value, Failure> {
+fn read(scope: &Scope, args: Read) -> std::result::Result<(Value, Vec<Mark>), Failure> {
     guard_resolved(&args.path)?;
     let meta = fs::metadata(&args.path).map_err(io_failure)?;
     if !meta.is_file() {
@@ -347,6 +379,7 @@ fn read(scope: &Scope, args: Read) -> std::result::Result<Value, Failure> {
             reason: Reason::Limit,
             message: "file exceeds the text read limit".into(),
             total_lines: None,
+            matches: None,
         });
     }
     let bytes = read_file(&args.path)?;
@@ -361,13 +394,19 @@ fn read(scope: &Scope, args: Read) -> std::result::Result<Value, Failure> {
         end: total,
     });
     if total == 0 && args.range.is_none() {
-        return Ok(Value::Read {
-            path: display(scope, &args.path),
-            start: 0,
-            end: 0,
-            total_lines: 0,
-            lines: Vec::new(),
-        });
+        return Ok((
+            Value::Read {
+                path: display(scope, &args.path),
+                start: 0,
+                end: 0,
+                total_lines: 0,
+                lines: Vec::new(),
+            },
+            vec![Mark {
+                path: fs::canonicalize(&args.path).map_err(io_failure)?,
+                sig: write::sig(&bytes),
+            }],
+        ));
     }
     if range.start == 0 || range.end < range.start || range.end > total {
         return Err(bad("line range is outside the file", Some(total)));
@@ -385,13 +424,19 @@ fn read(scope: &Scope, args: Read) -> std::result::Result<Value, Failure> {
             })
             .collect()
     };
-    Ok(Value::Read {
-        path: display(scope, &args.path),
-        start: range.start,
-        end: range.end,
-        total_lines: total,
-        lines: selected,
-    })
+    Ok((
+        Value::Read {
+            path: display(scope, &args.path),
+            start: range.start,
+            end: range.end,
+            total_lines: total,
+            lines: selected,
+        },
+        vec![Mark {
+            path: fs::canonicalize(&args.path).map_err(io_failure)?,
+            sig: write::sig(&bytes),
+        }],
+    ))
 }
 
 fn matched(args: &Search, value: &str) -> bool {
@@ -401,7 +446,7 @@ fn matched(args: &Search, value: &str) -> bool {
     )
 }
 
-fn display(scope: &Scope, path: &Path) -> String {
+pub(crate) fn display(scope: &Scope, path: &Path) -> String {
     path.strip_prefix(scope.root())
         .ok()
         .filter(|path| !path.as_os_str().is_empty())
@@ -410,7 +455,7 @@ fn display(scope: &Scope, path: &Path) -> String {
         .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
-fn guard(path: &Path) -> std::result::Result<(), Failure> {
+pub(crate) fn guard(path: &Path) -> std::result::Result<(), Failure> {
     if denied(path) {
         Err(deny(path))
     } else {
@@ -481,7 +526,7 @@ fn count_lines(path: &Path) -> std::result::Result<usize, Failure> {
     }
 }
 
-fn io_failure(error: io::Error) -> Failure {
+pub(crate) fn io_failure(error: io::Error) -> Failure {
     let reason = match error.kind() {
         io::ErrorKind::NotFound => Reason::NotFound,
         io::ErrorKind::PermissionDenied => Reason::Denied,
@@ -491,6 +536,7 @@ fn io_failure(error: io::Error) -> Failure {
         reason,
         message: error.to_string(),
         total_lines: None,
+        matches: None,
     }
 }
 
@@ -499,6 +545,7 @@ fn bad(message: &str, total_lines: Option<usize>) -> Failure {
         reason: Reason::BadArgs,
         message: message.into(),
         total_lines,
+        matches: None,
     }
 }
 
@@ -507,6 +554,7 @@ fn deny(path: &Path) -> Failure {
         reason: Reason::Denied,
         message: format!("read denied for {}", path.display()),
         total_lines: None,
+        matches: None,
     }
 }
 

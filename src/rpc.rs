@@ -5,7 +5,7 @@ use crate::{
     key::Key,
     proj::{Proj, TaskStatus},
     sess::{Call, Status},
-    tool::find,
+    tool::{find, write},
 };
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -158,6 +158,7 @@ struct Shared {
     clarify: Mutex<ClarifyState>,
     key: Key,
     proj: Arc<Proj>,
+    reads: write::Reads,
 }
 
 #[derive(Clone, PartialEq)]
@@ -227,6 +228,7 @@ impl Rpc {
             clarify: Mutex::new(ClarifyState::default()),
             key,
             proj,
+            reads: write::Reads::default(),
         });
         let (send, receive) = async_mpsc::unbounded_channel();
         let (started, status) = mpsc::sync_channel(1);
@@ -519,6 +521,8 @@ fn dispatch(
             "runtime.task" => task(&shared, input.params),
             "runtime.live_env" => live(&shared, input.params),
             "runtime.find" => find(&shared, input.params),
+            "runtime.write" => write(&shared, input.params),
+            "runtime.edit" => edit(&shared, input.params),
             "runtime.clarify.cancel" => cancel_clarify(&shared, input.params),
             "turn.chunk" => {
                 send_notice(&shared, order, input.params, |value: Chunk| Notice::Chunk {
@@ -894,10 +898,90 @@ fn find(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fa
             code: -32602,
             message: error.to_string(),
         })?;
-    serde_json::to_value(find::run(&scope, input)).map_err(|error| Failure {
+    let key = match (input.turn_id.clone(), input.request_id.clone()) {
+        (Some(turn), Some(request)) => Some(write::Key::new(turn, request).map_err(tool_failure)?),
+        (None, None) => None,
+        _ => {
+            return Err(Failure {
+                code: -32602,
+                message: "find run identity is incomplete".into(),
+            })
+        }
+    };
+    let mut outcome = find::run(&scope, input);
+    if outcome.result.ok {
+        if let Some(key) = key {
+            if let Err(error) = shared.reads.mark(key, outcome.reads) {
+                outcome.result = find::Result {
+                    ok: false,
+                    value: None,
+                    error: Some(error),
+                };
+            }
+        }
+    }
+    serde_json::to_value(outcome.result).map_err(|error| Failure {
         code: -32603,
         message: format!("encode find result: {error}"),
     })
+}
+
+fn write(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
+    let input: write::WriteInput =
+        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
+            code: -32602,
+            message: format!("decode write request: {error}"),
+        })?;
+    let scope = shared
+        .proj
+        .scope(input.task_id.as_deref())
+        .map_err(internal_failure)?;
+    write::Key::new(input.turn_id, input.request_id).map_err(tool_failure)?;
+    serde_json::to_value(shared.reads.write(&scope, &input.path, input.content)).map_err(|error| {
+        Failure {
+            code: -32603,
+            message: format!("encode write result: {error}"),
+        }
+    })
+}
+
+fn edit(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
+    let input: write::EditInput =
+        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
+            code: -32602,
+            message: format!("decode edit request: {error}"),
+        })?;
+    let scope = shared
+        .proj
+        .scope(input.task_id.as_deref())
+        .map_err(internal_failure)?;
+    let key = write::Key::new(input.turn_id, input.request_id).map_err(tool_failure)?;
+    serde_json::to_value(shared.reads.edit(
+        &scope,
+        key,
+        &input.path,
+        &input.target,
+        &input.replacement,
+        input.all,
+    ))
+    .map_err(|error| Failure {
+        code: -32603,
+        message: format!("encode edit result: {error}"),
+    })
+}
+
+fn tool_failure(error: find::Failure) -> Failure {
+    Failure {
+        code: -32602,
+        message: error.message,
+    }
+}
+
+fn internal_failure(error: anyhow::Error) -> Failure {
+    Failure {
+        code: -32603,
+        message: error.to_string(),
+    }
 }
 
 fn send_notice<T: for<'de> Deserialize<'de>>(
@@ -1030,6 +1114,7 @@ mod tests {
                 clarify: Mutex::new(ClarifyState::default()),
                 key: Key,
                 proj: Arc::new(Proj::open(root.to_path_buf()).unwrap()),
+                reads: write::Reads::default(),
             },
             interaction_input,
         )
@@ -1103,13 +1188,14 @@ mod tests {
         task(
             &shared,
             Some(serde_json::json!({
-                "action": "create", "title": "search project text", "path": work
+                "action": "create", "title": "search project text", "path": work.clone()
             })),
         )
         .unwrap();
         let result = find(
             &shared,
             Some(serde_json::json!({
+                "turn_id": "run-a", "request_id": "request-a",
                 "query": "needle", "in": "content", "context": 1
             })),
         )
@@ -1119,6 +1205,29 @@ mod tests {
         assert_eq!(result["hits"][0]["path"], "src/main.rs");
         assert_eq!(result["hits"][0]["line"], 2);
         assert_eq!(result["hits"][0]["context"].as_array().unwrap().len(), 3);
+        let denied = edit(
+            &shared,
+            Some(serde_json::json!({
+                "turn_id": "run-b", "request_id": "request-a", "path": "src/main.rs",
+                "target": "needle", "replacement": "changed"
+            })),
+        )
+        .unwrap();
+        assert_eq!(denied["error"]["reason"], "denied");
+        let edited = edit(
+            &shared,
+            Some(serde_json::json!({
+                "turn_id": "run-a", "request_id": "request-a", "path": "src/main.rs",
+                "target": "needle", "replacement": "changed"
+            })),
+        )
+        .unwrap();
+        assert_eq!(edited["ok"], true);
+        assert_eq!(edited["replacements"], 1);
+        assert_eq!(
+            std::fs::read_to_string(work.join("src/main.rs")).unwrap(),
+            "first\nchanged\nlast\n"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -81,6 +81,34 @@ var findTool = model.Tool{
 	},
 }
 
+var writeTool = model.Tool{
+	Name:        "write",
+	Description: "Create a UTF-8 text file or replace one whole. Relative paths use the run's project.",
+	Parameters: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"path":    map[string]any{"type": "string"},
+			"content": map[string]any{"type": "string"},
+		},
+		"required": []string{"path", "content"}, "additionalProperties": false,
+	},
+}
+
+var editTool = model.Tool{
+	Name:        "edit",
+	Description: "Replace exact text in a file already read by this run. The target must be unique unless all is true.",
+	Parameters: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"path":        map[string]any{"type": "string"},
+			"target":      map[string]any{"type": "string"},
+			"replacement": map[string]any{"type": "string"},
+			"all":         map[string]any{"type": "boolean"},
+		},
+		"required": []string{"path", "target", "replacement"}, "additionalProperties": false,
+	},
+}
+
 type taskArgs struct {
 	Action string `json:"action"`
 	Title  string `json:"title,omitempty"`
@@ -124,8 +152,33 @@ type findArgs struct {
 }
 
 type findRequest struct {
+	callID
 	TaskID string `json:"task_id,omitempty"`
 	findArgs
+}
+
+type writeArgs struct {
+	Path    string  `json:"path"`
+	Content *string `json:"content"`
+}
+
+type editArgs struct {
+	Path        string  `json:"path"`
+	Target      string  `json:"target"`
+	Replacement *string `json:"replacement"`
+	All         bool    `json:"all,omitempty"`
+}
+
+type writeRequest struct {
+	callID
+	TaskID string `json:"task_id,omitempty"`
+	writeArgs
+}
+
+type editRequest struct {
+	callID
+	TaskID string `json:"task_id,omitempty"`
+	editArgs
 }
 
 func declarations(tools []model.Tool) (string, error) {
@@ -192,7 +245,31 @@ func execTool(ctx context.Context, peer *rpc, id callID, taskID string, call mod
 			return result
 		}
 		var output map[string]any
-		if err := peer.call(ctx, "runtime.find", findRequest{TaskID: taskID, findArgs: args}, &output); err != nil {
+		if err := peer.call(ctx, "runtime.find", findRequest{callID: id, TaskID: taskID, findArgs: args}, &output); err != nil {
+			result.Data = map[string]any{"error": err.Error()}
+		} else {
+			result.Data = output
+		}
+	case writeTool.Name:
+		var args writeArgs
+		if err := decodeArgs(call.Args, &args); err != nil || checkWrite(args) != nil {
+			result.Data = map[string]any{"error": "write requires path and content"}
+			return result
+		}
+		var output map[string]any
+		if err := peer.call(ctx, "runtime.write", writeRequest{callID: id, TaskID: taskID, writeArgs: args}, &output); err != nil {
+			result.Data = map[string]any{"error": err.Error()}
+		} else {
+			result.Data = output
+		}
+	case editTool.Name:
+		var args editArgs
+		if err := decodeArgs(call.Args, &args); err != nil || checkEdit(args) != nil {
+			result.Data = map[string]any{"error": "edit requires path, target and replacement"}
+			return result
+		}
+		var output map[string]any
+		if err := peer.call(ctx, "runtime.edit", editRequest{callID: id, TaskID: taskID, editArgs: args}, &output); err != nil {
 			result.Data = map[string]any{"error": err.Error()}
 		} else {
 			result.Data = output
@@ -201,6 +278,20 @@ func execTool(ctx context.Context, peer *rpc, id callID, taskID string, call mod
 		result.Data = map[string]any{"error": "unknown tool"}
 	}
 	return result
+}
+
+func checkWrite(args writeArgs) error {
+	if strings.TrimSpace(args.Path) == "" || args.Content == nil {
+		return errors.New("write requires path and content")
+	}
+	return nil
+}
+
+func checkEdit(args editArgs) error {
+	if strings.TrimSpace(args.Path) == "" || args.Target == "" || args.Replacement == nil {
+		return errors.New("edit requires path, target and replacement")
+	}
+	return nil
 }
 
 func checkFind(args findArgs) error {

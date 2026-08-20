@@ -45,6 +45,8 @@ impl Drop for Tree {
 
 fn search(query: &str) -> Input {
     Input {
+        turn_id: None,
+        request_id: None,
         task_id: None,
         query: Some(query.into()),
         regex: false,
@@ -60,6 +62,8 @@ fn search(query: &str) -> Input {
 
 fn read(path: &str, range: Option<Range>) -> Input {
     Input {
+        turn_id: None,
+        request_id: None,
         task_id: None,
         query: None,
         regex: false,
@@ -73,7 +77,8 @@ fn read(path: &str, range: Option<Range>) -> Input {
     }
 }
 
-fn value(result: Result) -> Value {
+fn value(outcome: Outcome) -> Value {
+    let result = outcome.result;
     assert!(result.ok, "find failed: {:?}", result.error);
     result.value.unwrap()
 }
@@ -149,7 +154,7 @@ fn range_reads_are_line_aware_and_paths_may_leave_scope() {
         .collect::<Vec<_>>()
         .join("\n");
     tree.write("long.txt", long.as_bytes());
-    let failed = run(&tree.scope, read("long.txt", None));
+    let failed = run(&tree.scope, read("long.txt", None)).result;
     assert!(!failed.ok);
     let error = failed.error.unwrap();
     assert!(matches!(error.reason, Reason::BadArgs));
@@ -206,7 +211,7 @@ fn denylist_blocks_sensitive_names_and_symlink_aliases() {
     tree.write(".env.local", b"TOKEN=secret\n");
     tree.write("private.pem", b"secret\n");
     for path in [".env.local", "private.pem"] {
-        let result = run(&tree.scope, read(path, None));
+        let result = run(&tree.scope, read(path, None)).result;
         assert!(!result.ok);
         assert!(matches!(result.error.unwrap().reason, Reason::Denied));
     }
@@ -218,7 +223,7 @@ fn denylist_blocks_sensitive_names_and_symlink_aliases() {
         fs::create_dir_all(secret.parent().unwrap()).unwrap();
         fs::write(&secret, b"secret\n").unwrap();
         symlink(&secret, tree.work.join("alias.txt")).unwrap();
-        let result = run(&tree.scope, read("alias.txt", None));
+        let result = run(&tree.scope, read("alias.txt", None)).result;
         assert!(!result.ok);
         assert!(matches!(result.error.unwrap().reason, Reason::Denied));
     }
@@ -244,7 +249,7 @@ fn binary_content_is_skipped_but_path_search_remains_available() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].path, "binary-needle.bin");
 
-    let result = run(&tree.scope, read("binary-needle.bin", None));
+    let result = run(&tree.scope, read("binary-needle.bin", None)).result;
     assert!(!result.ok);
     assert!(matches!(result.error.unwrap().reason, Reason::BadArgs));
 }
