@@ -15,7 +15,7 @@ import (
 
 const (
 	defaultModel = "gemini-3.7-flash"
-	systemPrompt = "You are pippo, a collaborative desktop agent. Answer clearly and report only what you know."
+	systemPrompt = "You are pippo, a collaborative desktop agent. Register concrete project work with task before delegating it, close it after verified work, and report only what you know."
 )
 
 type prompt struct {
@@ -146,12 +146,18 @@ func startTurn(state *state) handler {
 		if err != nil {
 			return nil, err
 		}
+		toolText, err := declarations([]model.Tool{taskTool})
+		if err != nil {
+			return nil, err
+		}
 		request := assemble(modelName, prompt{
 			SystemPrompt:      systemPrompt,
+			ToolDeclarations:  toolText,
 			StaticEnvironment: environment,
 			Transcript:        input.Transcript,
 			Query:             input.Query,
 		})
+		request.Tools = []model.Tool{taskTool}
 		runCtx, ok := state.loop.start(ctx, input.callID)
 		if !ok {
 			return nil, errors.New("model request is already running")
@@ -185,12 +191,7 @@ func (l *loop) stream(ctx context.Context, peer *rpc, id callID, request model.R
 	} else if secret.Value == "" {
 		status, detail = "failed", "model key is missing"
 	} else {
-		err := l.provider.Stream(ctx, secret.Value, request, func(value model.Chunk) error {
-			if value.Text == "" {
-				return nil
-			}
-			return peer.notify("turn.chunk", chunk{callID: id, Text: value.Text})
-		})
+		err := l.run(ctx, peer, secret.Value, &request, id)
 		secret.Value = ""
 		if ctx.Err() != nil {
 			status = "cancelled"
@@ -203,6 +204,44 @@ func (l *loop) stream(ctx context.Context, peer *rpc, id callID, request model.R
 	}
 	if err := peer.notify("turn.closed", closed{callID: id, Status: status, Error: detail}); err != nil {
 		log.Printf("finish turn %q request %q: %v", id.Turn, id.Request, err)
+	}
+}
+
+func (l *loop) run(ctx context.Context, peer *rpc, key string, request *model.Request, id callID) error {
+	for {
+		var text strings.Builder
+		var calls []model.Call
+		seen := make(map[string]bool)
+		err := l.provider.Stream(ctx, key, *request, func(value model.Chunk) error {
+			if value.Text != "" {
+				text.WriteString(value.Text)
+				if err := peer.notify("turn.chunk", chunk{callID: id, Text: value.Text}); err != nil {
+					return err
+				}
+			}
+			if value.Call != nil {
+				identity, err := json.Marshal(value.Call)
+				if err != nil {
+					return fmt.Errorf("encode tool call: %w", err)
+				}
+				if !seen[string(identity)] {
+					seen[string(identity)] = true
+					calls = append(calls, *value.Call)
+				}
+			}
+			return nil
+		})
+		if err != nil || len(calls) == 0 {
+			return err
+		}
+		request.History = append(request.History, model.Message{
+			Role: "model", Text: text.String(), Calls: calls,
+		})
+		results := make([]model.Result, 0, len(calls))
+		for _, call := range calls {
+			results = append(results, execTool(ctx, peer, call))
+		}
+		request.History = append(request.History, model.Message{Role: "user", Results: results})
 	}
 }
 

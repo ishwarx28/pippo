@@ -23,12 +23,40 @@ type Block struct {
 }
 
 type Request struct {
-	Model  string
-	Blocks []Block
+	Model   string
+	Blocks  []Block
+	Tools   []Tool
+	History []Message
 }
 
 type Chunk struct {
 	Text string
+	Call *Call
+}
+
+type Tool struct {
+	Name        string
+	Description string
+	Parameters  map[string]any
+}
+
+type Call struct {
+	ID   string
+	Name string
+	Args map[string]any
+}
+
+type Result struct {
+	ID   string
+	Name string
+	Data map[string]any
+}
+
+type Message struct {
+	Role    string
+	Text    string
+	Calls   []Call
+	Results []Result
 }
 
 type Provider interface {

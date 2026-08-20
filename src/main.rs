@@ -4,6 +4,7 @@
 mod cfg;
 mod ipc;
 mod key;
+mod proj;
 mod rpc;
 mod sess;
 mod store;
@@ -231,6 +232,7 @@ fn run() -> Result<()> {
     let cfg = cfg::load_at(root.clone())?;
     let store = store::Store::open(root.clone())?;
     let sess = Arc::new(sess::Sess::new(store)?);
+    let proj = Arc::new(proj::Proj::open(root.clone())?);
     let spawned = Service::spawn()?;
     let key = key::Key;
     let rpc = rpc::Rpc::connect(
@@ -238,6 +240,7 @@ fn run() -> Result<()> {
         spawned.token,
         &rpc::Hello::new(&root, &cfg)?,
         key,
+        Arc::clone(&proj),
     )?;
     let notices = rpc.take_notices()?;
     let event_sess = Arc::clone(&sess);
@@ -245,6 +248,7 @@ fn run() -> Result<()> {
         .manage(cfg)
         .manage(key)
         .manage(sess)
+        .manage(proj)
         .manage(rpc)
         .manage(spawned.service)
         .manage(Shutdown::default())
@@ -298,9 +302,22 @@ mod tests {
     fn child_rpc_is_authenticated_and_concurrent() {
         let spawned = Service::spawn().unwrap();
         assert_eq!(spawned.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
-        let hello = rpc::Hello::new(&std::env::temp_dir(), &cfg::Config::default()).unwrap();
-        let rpc = rpc::Rpc::connect(spawned.addr, spawned.token.clone(), &hello, key::Key).unwrap();
-        assert!(rpc::Rpc::connect(spawned.addr, spawned.token, &hello, key::Key).is_err());
+        let root = std::env::temp_dir().join(format!(
+            "pippo-child-rpc-{}-{}",
+            std::process::id(),
+            token().unwrap()
+        ));
+        let hello = rpc::Hello::new(&root, &cfg::Config::default()).unwrap();
+        let proj = Arc::new(proj::Proj::open(root.clone()).unwrap());
+        let rpc = rpc::Rpc::connect(
+            spawned.addr,
+            spawned.token.clone(),
+            &hello,
+            key::Key,
+            Arc::clone(&proj),
+        )
+        .unwrap();
+        assert!(rpc::Rpc::connect(spawned.addr, spawned.token, &hello, key::Key, proj).is_err());
 
         thread::scope(|scope| {
             let calls: Vec<_> = (0..16)
@@ -324,6 +341,7 @@ mod tests {
         assert!(service.stop().unwrap());
         assert!(service.stop().unwrap());
         assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -339,7 +357,8 @@ mod tests {
         sess.chunk(&turn.call, "partial".into()).unwrap();
         let spawned = Service::spawn().unwrap();
         let hello = rpc::Hello::new(&root, &cfg::Config::default()).unwrap();
-        let rpc = rpc::Rpc::connect(spawned.addr, spawned.token, &hello, key::Key).unwrap();
+        let proj = Arc::new(proj::Proj::open(root.clone()).unwrap());
+        let rpc = rpc::Rpc::connect(spawned.addr, spawned.token, &hello, key::Key, proj).unwrap();
         let shutdown = Shutdown::default();
 
         shutdown.run(&sess, &rpc, &spawned.service).unwrap();

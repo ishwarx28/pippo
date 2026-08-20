@@ -3,6 +3,7 @@
 use crate::{
     cfg::Config,
     key::Key,
+    proj::{Proj, TaskStatus},
     sess::{Call, Status},
 };
 use anyhow::{Context, Result};
@@ -125,6 +126,7 @@ struct Shared {
     pending: Mutex<Pending>,
     notices: Mutex<Option<mpsc::Sender<Stamped>>>,
     key: Key,
+    proj: Arc<Proj>,
 }
 
 struct Pending {
@@ -146,8 +148,14 @@ pub struct Rpc {
 }
 
 impl Rpc {
-    pub fn connect(addr: SocketAddr, token: String, hello: &Hello, key: Key) -> Result<Self> {
-        let rpc = Self::open(addr, token, key)?;
+    pub fn connect(
+        addr: SocketAddr,
+        token: String,
+        hello: &Hello,
+        key: Key,
+        proj: Arc<Proj>,
+    ) -> Result<Self> {
+        let rpc = Self::open(addr, token, key, proj)?;
         let ready: Ready = rpc.call("hello", hello)?;
         if !ready.ready {
             anyhow::bail!("child process did not accept startup hello");
@@ -155,7 +163,7 @@ impl Rpc {
         Ok(rpc)
     }
 
-    fn open(addr: SocketAddr, token: String, key: Key) -> Result<Self> {
+    fn open(addr: SocketAddr, token: String, key: Key, proj: Arc<Proj>) -> Result<Self> {
         let (notice_send, notice_receive) = mpsc::channel();
         let shared = Arc::new(Shared {
             pending: Mutex::new(Pending {
@@ -164,6 +172,7 @@ impl Rpc {
             }),
             notices: Mutex::new(Some(notice_send)),
             key,
+            proj,
         });
         let (send, receive) = async_mpsc::unbounded_channel();
         let (started, status) = mpsc::sync_channel(1);
@@ -423,6 +432,7 @@ fn dispatch(
                     message: error.to_string(),
                 }),
             },
+            "runtime.task" => task(&shared, input.params),
             "turn.chunk" => {
                 send_notice(&shared, order, input.params, |value: Chunk| Notice::Chunk {
                     call: value.call,
@@ -482,6 +492,41 @@ struct Closed {
     call: Call,
     status: Status,
     error: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "lowercase")]
+#[serde(deny_unknown_fields)]
+enum TaskInput {
+    Create {
+        title: String,
+        path: PathBuf,
+    },
+    Update {
+        id: String,
+        status: TaskStatus,
+        note: String,
+    },
+}
+
+fn task(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
+    let input: TaskInput =
+        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
+            code: -32602,
+            message: format!("decode task request: {error}"),
+        })?;
+    let result = match input {
+        TaskInput::Create { title, path } => shared.proj.create(title, path),
+        TaskInput::Update { id, status, note } => shared.proj.update(id, status, note),
+    }
+    .map_err(|error| Failure {
+        code: -32602,
+        message: error.to_string(),
+    })?;
+    serde_json::to_value(result).map_err(|error| Failure {
+        code: -32603,
+        message: format!("encode task result: {error}"),
+    })
 }
 
 fn send_notice<T: for<'de> Deserialize<'de>>(
@@ -585,6 +630,9 @@ mod tests {
     fn closing_connection_unblocks_pending_callers() {
         let (notices, _input) = mpsc::channel();
         let (answer, received) = mpsc::sync_channel(1);
+        let root =
+            std::env::temp_dir().join(format!("pippo-rpc-proj-{}-closing", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         let shared = Shared {
             pending: Mutex::new(Pending {
                 waits: HashMap::from([(7, answer)]),
@@ -592,6 +640,7 @@ mod tests {
             }),
             notices: Mutex::new(Some(notices)),
             key: Key,
+            proj: Arc::new(Proj::open(root.clone()).unwrap()),
         };
 
         close_shared(&shared, "stopped");
@@ -600,5 +649,43 @@ mod tests {
         close_shared(&shared, "stopped again");
         assert!(shared.pending.lock().unwrap().closed);
         assert!(shared.notices.lock().unwrap().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn task_requests_reach_durable_project_state() {
+        let root = std::env::temp_dir().join(format!("pippo-rpc-proj-{}-task", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let (notices, _input) = mpsc::channel();
+        let shared = Shared {
+            pending: Mutex::new(Pending {
+                waits: HashMap::new(),
+                closed: false,
+            }),
+            notices: Mutex::new(Some(notices)),
+            key: Key,
+            proj: Arc::new(Proj::open(root.clone()).unwrap()),
+        };
+        let created = task(
+            &shared,
+            Some(serde_json::json!({
+                "action": "create", "title": "add upload retry", "path": work
+            })),
+        )
+        .unwrap();
+        let id = created["task_id"].as_str().unwrap();
+        assert!(id.starts_with("t_") && id.len() == 10);
+        assert!(task(
+            &shared,
+            Some(serde_json::json!({
+                "action": "update", "id": id, "status": "done", "note": "verified"
+            }))
+        )
+        .is_ok());
+        drop(shared);
+        assert!(Proj::open(root.clone()).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
