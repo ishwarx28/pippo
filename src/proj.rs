@@ -1,6 +1,6 @@
 // Owns project registration and durable task state.
 
-use crate::store::{atomic, replace};
+use crate::store::{self, atomic, replace};
 use anyhow::{Context, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -208,7 +208,7 @@ impl Proj {
             }
         };
         let id = loop {
-            let id = task_id()?;
+            let id = store::id("t", 4)?;
             if !state.meta.tasks.contains_key(&id) {
                 break id;
             }
@@ -752,16 +752,6 @@ fn project(path: &Path) -> Result<Project> {
         name: name.into(),
         path: path.to_path_buf(),
     })
-}
-
-fn task_id() -> Result<String> {
-    let mut bytes = [0_u8; 4];
-    getrandom::fill(&mut bytes).map_err(|error| anyhow::anyhow!("generate task id: {error}"))?;
-    let mut id = String::from("t_");
-    for byte in bytes {
-        write!(id, "{byte:02x}").context("encode task id")?;
-    }
-    Ok(id)
 }
 
 fn valid_task_id(id: &str) -> bool {

@@ -3,11 +3,30 @@
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
+    fmt::Write as _,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
+
+pub fn id(prefix: &str, bytes: usize) -> Result<String> {
+    let mut raw = vec![0_u8; bytes];
+    getrandom::fill(&mut raw).map_err(|error| anyhow::anyhow!("generate {prefix} id: {error}"))?;
+    let mut value = format!("{prefix}_");
+    for byte in raw {
+        write!(value, "{byte:02x}").context("encode id")?;
+    }
+    Ok(value)
+}
+
+pub fn load<T: DeserializeOwned + Default>(path: &Path) -> Result<T> {
+    if !path.exists() {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(&fs::read(path).with_context(|| format!("read {}", path.display()))?)
+        .with_context(|| format!("parse {}", path.display()))
+}
 
 pub fn atomic(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(value).context("serialize state")?;

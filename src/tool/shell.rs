@@ -174,12 +174,12 @@ fn execute(scope: &Scope, input: Input, stop: &AtomicBool) -> Result {
             Ok(Some(status)) => break Ok(status),
             Ok(None) if stop.load(Ordering::Acquire) => {
                 cancelled = true;
-                terminate(&mut child, pid);
+                kill_group(pid, Some(&mut child));
                 break child.wait();
             }
             Ok(None) if Instant::now() >= deadline => {
                 timed_out = true;
-                terminate(&mut child, pid);
+                kill_group(pid, Some(&mut child));
                 break child.wait();
             }
             Ok(None) => thread::sleep(POLL),
@@ -187,7 +187,7 @@ fn execute(scope: &Scope, input: Input, stop: &AtomicBool) -> Result {
         }
     };
     if !timed_out && !cancelled && group_exists(pid) {
-        terminate(&mut child, pid);
+        kill_group(pid, Some(&mut child));
     }
     let status = match status {
         Ok(status) => status,
@@ -268,11 +268,14 @@ pub(crate) fn policy_cwd(
     validate(scope, input).map(|value| value.0)
 }
 
-fn terminate(child: &mut Child, pgid: i32) {
+/// Reaping our own child is what lets the group disappear before the grace period ends.
+pub(crate) fn kill_group(pgid: i32, mut child: Option<&mut Child>) {
     signal(pgid, libc::SIGTERM);
     let deadline = Instant::now() + KILL_GRACE;
     while Instant::now() < deadline {
-        let _ = child.try_wait();
+        if let Some(child) = child.as_deref_mut() {
+            let _ = child.try_wait();
+        }
         if !group_exists(pgid) {
             return;
         }
@@ -293,7 +296,7 @@ fn group_exists(pgid: i32) -> bool {
 }
 
 fn broken_child(child: &mut Child, pid: i32, message: &str) -> Result {
-    terminate(child, pid);
+    kill_group(pid, Some(child));
     let _ = child.wait();
     failed(fail(find::Reason::Busy, message))
 }

@@ -153,7 +153,6 @@ fn write_private(path: &Path, auth: &Auth) -> Result<()> {
         .with_context(|| format!("flush model key directory {}", parent.display()))
 }
 
-#[cfg(unix)]
 fn private(path: &Path) -> std::io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
     OpenOptions::new()
@@ -164,16 +163,6 @@ fn private(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
-#[cfg(not(unix))]
-fn private(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
-}
-
-#[cfg(unix)]
 fn protect(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mode = fs::metadata(path)
@@ -185,11 +174,6 @@ fn protect(path: &Path) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(MODE))
             .with_context(|| format!("restrict model key {}", path.display()))?;
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn protect(_path: &Path) -> Result<()> {
     Ok(())
 }
 
