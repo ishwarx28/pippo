@@ -504,7 +504,19 @@ pub struct Sess {
 
 impl Sess {
     pub fn new(store: Store) -> Result<Self> {
-        let messages = store.replay::<Vec<Message>>()?;
+        let mut messages = store.replay::<Vec<Message>>()?;
+        // A hard exit never reaches shutdown, so a turn left running would never close again.
+        let mut interrupted = false;
+        for message in &mut messages {
+            if message.status == Some(Status::Running) {
+                message.status = Some(Status::Cancelled);
+                message.error = None;
+                interrupted = true;
+            }
+        }
+        if interrupted {
+            store.replace_replay(&messages)?;
+        }
         Ok(Self {
             store,
             state: Mutex::new(State {

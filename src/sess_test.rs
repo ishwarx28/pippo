@@ -195,3 +195,38 @@ fn restores_message_projection_from_replay() {
     assert_eq!(restored.snapshot().unwrap(), messages);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn a_turn_killed_mid_reply_is_closed_when_the_session_reopens() {
+    let root = root();
+    let killed = session(&root);
+    let start = killed.open("hello".into()).unwrap();
+    killed.chunk(&start.call, "partial".into()).unwrap();
+    drop(killed);
+
+    let restored = session(&root);
+    let messages = restored.snapshot().unwrap();
+    assert_eq!(messages[1].text, "partial");
+    assert_eq!(messages[1].status, Some(Status::Cancelled));
+    assert_eq!(
+        Store::open(root.clone())
+            .unwrap()
+            .replay::<Vec<Message>>()
+            .unwrap(),
+        messages
+    );
+    let next = restored.open("again".into()).unwrap();
+    assert_eq!(
+        restored
+            .close(&next.call, Status::Done, None)
+            .unwrap()
+            .unwrap(),
+        Event::Closed {
+            call: next.call.clone(),
+            message_id: format!("{}_assistant", next.call.turn_id),
+            status: Status::Done,
+            error: None,
+        }
+    );
+    fs::remove_dir_all(root).unwrap();
+}
