@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useReducer, useRef, useState } from "react";
 import { Composer } from "./Composer";
+import { ClarifySheet, type ClarifyPrompt } from "./ClarifySheet";
 import { Header } from "./Header";
 import { MessageView } from "./Message";
 import { ModelKeyCard } from "./ModelKeyCard";
@@ -49,6 +50,9 @@ type Closed = {
 type TurnEvent = Opened | Chunk | Closed;
 type KeyStatus = "missing" | "stored";
 type MessageAction = TurnEvent | { kind: "hydrate"; messages: Message[] };
+type InteractionEvent =
+  | { kind: "clarify_opened"; prompt: ClarifyPrompt }
+  | { kind: "clarify_closed"; id: string; error?: string };
 
 function applyEvent(messages: Message[], event: MessageAction): Message[] {
   if (event.kind === "hydrate") {
@@ -88,6 +92,9 @@ export function App() {
   const [keyError, setKeyError] = useState<string>();
   const [sending, setSending] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [clarify, setClarify] = useState<ClarifyPrompt>();
+  const [clarifyDraft, setClarifyDraft] = useState("");
+  const [clarifyBusy, setClarifyBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [announcement, setAnnouncement] = useState("");
   const opened = useRef(0);
@@ -132,6 +139,44 @@ export function App() {
       }
     }
     void hydrate();
+    return () => {
+      active = false;
+      stop?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let stop: (() => void) | undefined;
+    async function watchInteractions() {
+      try {
+        const unlisten = await listen<InteractionEvent>("interaction-event", ({ payload }) => {
+          if (!active) return;
+          if (payload.kind === "clarify_opened") {
+            setClarify(payload.prompt);
+            setClarifyDraft("");
+            setClarifyBusy(false);
+            setAnnouncement("Question needs your answer");
+          } else {
+            setClarify((current) => (current?.id === payload.id ? undefined : current));
+            setClarifyDraft("");
+            setClarifyBusy(false);
+            if (payload.error) {
+              setError(payload.error);
+              setAnnouncement(payload.error);
+            }
+          }
+        });
+        if (!active) {
+          unlisten();
+          return;
+        }
+        stop = unlisten;
+      } catch (reason) {
+        if (active) setError(`Could not receive questions: ${detail(reason)}`);
+      }
+    }
+    void watchInteractions();
     return () => {
       active = false;
       stop?.();
@@ -216,6 +261,31 @@ export function App() {
     }
   }
 
+  async function answerClarify(answer: string) {
+    if (!clarify || clarifyBusy) return;
+    setClarifyBusy(true);
+    setError(undefined);
+    try {
+      await invoke("answer_clarify", { id: clarify.id, answer });
+      setAnnouncement("Answer sent");
+    } catch (reason) {
+      setClarifyBusy(false);
+      setError(`Could not answer the question: ${detail(reason)}`);
+    }
+  }
+
+  async function cancelClarify() {
+    if (!clarify || clarifyBusy) return;
+    setClarifyBusy(true);
+    setError(undefined);
+    try {
+      await invoke("cancel_clarify", { id: clarify.id });
+    } catch (reason) {
+      setClarifyBusy(false);
+      setError(`Could not cancel the question: ${detail(reason)}`);
+    }
+  }
+
   return (
     <main className="shell">
       <Header running={running} />
@@ -260,6 +330,16 @@ export function App() {
         onSend={() => void send()}
         onStop={() => void stop()}
       />
+      {clarify && (
+        <ClarifySheet
+          prompt={clarify}
+          value={clarifyDraft}
+          busy={clarifyBusy}
+          onChange={setClarifyDraft}
+          onAnswer={(answer) => void answerClarify(answer)}
+          onCancel={() => void cancelClarify()}
+        />
+      )}
       <p className="sr-only" aria-live="polite" aria-atomic="true">
         {announcement}
       </p>

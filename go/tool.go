@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,30 @@ var taskTool = model.Tool{
 	},
 }
 
+var clarifyTool = model.Tool{
+	Name: "clarify",
+	Description: "Ask the user one outcome-changing question and wait for their answer. " +
+		"Options are suggestions; the user can always type a free-form answer.",
+	Parameters: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"question": map[string]any{"type": "string", "description": "One plain question."},
+			"options": map[string]any{
+				"type": "array", "maxItems": 8,
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"label":       map[string]any{"type": "string"},
+						"recommended": map[string]any{"type": "boolean"},
+					},
+					"required": []string{"label"}, "additionalProperties": false,
+				},
+			},
+		},
+		"required": []string{"question"}, "additionalProperties": false,
+	},
+}
+
 type taskArgs struct {
 	Action string `json:"action"`
 	Title  string `json:"title,omitempty"`
@@ -36,6 +61,22 @@ type taskArgs struct {
 	ID     string `json:"id,omitempty"`
 	Status string `json:"status,omitempty"`
 	Note   string `json:"note,omitempty"`
+}
+
+type clarifyOption struct {
+	Label       string `json:"label"`
+	Recommended bool   `json:"recommended,omitempty"`
+}
+
+type clarifyArgs struct {
+	Question string          `json:"question"`
+	Options  []clarifyOption `json:"options,omitempty"`
+}
+
+type clarifyRequest struct {
+	callID
+	CallID string `json:"call_id"`
+	clarifyArgs
 }
 
 func declarations(tools []model.Tool) (string, error) {
@@ -50,33 +91,61 @@ func declarations(tools []model.Tool) (string, error) {
 	return strings.Join(lines, "\n"), nil
 }
 
-func execTool(ctx context.Context, peer *rpc, call model.Call) model.Result {
+func execTool(ctx context.Context, peer *rpc, id callID, call model.Call) model.Result {
 	result := model.Result{ID: call.ID, Name: call.Name}
-	if call.Name != taskTool.Name {
+	switch call.Name {
+	case taskTool.Name:
+		var args taskArgs
+		if err := decodeArgs(call.Args, &args); err != nil {
+			result.Data = map[string]any{"error": "invalid task arguments"}
+			return result
+		}
+		if err := checkTask(args); err != nil {
+			result.Data = map[string]any{"error": err.Error()}
+			return result
+		}
+		var output map[string]any
+		if err := peer.call(ctx, "runtime.task", args, &output); err != nil {
+			result.Data = map[string]any{"error": err.Error()}
+		} else {
+			result.Data = map[string]any{"output": output}
+		}
+	case clarifyTool.Name:
+		var args clarifyArgs
+		if err := decodeArgs(call.Args, &args); err != nil {
+			result.Data = map[string]any{"error": "invalid clarify arguments"}
+			return result
+		}
+		if err := checkClarify(args); err != nil {
+			result.Data = map[string]any{"error": err.Error()}
+			return result
+		}
+		input := clarifyRequest{callID: id, CallID: call.ID, clarifyArgs: args}
+		var output struct {
+			Answer string `json:"answer"`
+		}
+		if err := peer.call(ctx, "runtime.clarify", input, &output); err != nil {
+			if ctx.Err() != nil {
+				_ = peer.notify("runtime.clarify.cancel", input)
+			}
+			result.Data = map[string]any{"error": err.Error()}
+		} else {
+			result.Data = map[string]any{"answer": output.Answer}
+		}
+	default:
 		result.Data = map[string]any{"error": "unknown tool"}
-		return result
-	}
-	raw, err := json.Marshal(call.Args)
-	if err != nil {
-		result.Data = map[string]any{"error": "invalid task arguments"}
-		return result
-	}
-	var args taskArgs
-	if err := json.Unmarshal(raw, &args); err != nil {
-		result.Data = map[string]any{"error": "invalid task arguments"}
-		return result
-	}
-	if err := checkTask(args); err != nil {
-		result.Data = map[string]any{"error": err.Error()}
-		return result
-	}
-	var output map[string]any
-	if err := peer.call(ctx, "runtime.task", args, &output); err != nil {
-		result.Data = map[string]any{"error": err.Error()}
-	} else {
-		result.Data = map[string]any{"output": output}
 	}
 	return result
+}
+
+func decodeArgs(input map[string]any, output any) error {
+	raw, err := json.Marshal(input)
+	if err != nil {
+		return err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(output)
 }
 
 func checkTask(args taskArgs) error {
@@ -94,6 +163,35 @@ func checkTask(args taskArgs) error {
 		}
 	default:
 		return fmt.Errorf("invalid task action %q", args.Action)
+	}
+	return nil
+}
+
+func checkClarify(args clarifyArgs) error {
+	question := strings.TrimSpace(args.Question)
+	if question == "" || strings.ContainsAny(question, "\r\n") {
+		return errors.New("clarify requires one plain question")
+	}
+	if len(args.Options) > 8 {
+		return errors.New("clarify accepts at most eight options")
+	}
+	recommended := 0
+	seen := make(map[string]bool, len(args.Options))
+	for _, option := range args.Options {
+		label := strings.TrimSpace(option.Label)
+		if label == "" || strings.ContainsAny(label, "\r\n") {
+			return errors.New("clarify options must be plain non-empty labels")
+		}
+		if seen[label] {
+			return errors.New("clarify options must be unique")
+		}
+		seen[label] = true
+		if option.Recommended {
+			recommended++
+		}
+	}
+	if recommended > 1 {
+		return errors.New("clarify accepts at most one recommended option")
 	}
 	return nil
 }

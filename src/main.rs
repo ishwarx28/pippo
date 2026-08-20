@@ -36,7 +36,7 @@ pub struct Service {
 #[derive(Default)]
 struct Shutdown {
     started: AtomicBool,
-    events: Mutex<Option<thread::JoinHandle<()>>>,
+    events: Mutex<Vec<thread::JoinHandle<()>>>,
 }
 
 struct Spawned {
@@ -148,14 +148,15 @@ impl Drop for Service {
 }
 
 impl Shutdown {
-    fn set_events(&self, events: thread::JoinHandle<()>) -> Result<()> {
+    fn set_events(&self, events: Vec<thread::JoinHandle<()>>) -> Result<()> {
         let mut slot = self
             .events
             .lock()
             .map_err(|_| anyhow::anyhow!("turn event thread lock poisoned"))?;
-        if slot.replace(events).is_some() {
+        if !slot.is_empty() {
             anyhow::bail!("turn event thread already set");
         }
+        *slot = events;
         Ok(())
     }
 
@@ -178,14 +179,18 @@ impl Shutdown {
             "request child shutdown",
         );
         keep(&mut errors, rpc.shutdown(), "close rpc");
-        let events = self.events.lock().map(|mut events| events.take());
+        let events = self
+            .events
+            .lock()
+            .map(|mut events| events.drain(..).collect::<Vec<_>>());
         match events {
-            Ok(Some(events)) => {
-                if events.join().is_err() {
-                    errors.push("join turn events: thread panicked".into());
+            Ok(events) => {
+                for event in events {
+                    if event.join().is_err() {
+                        errors.push("join interface events: thread panicked".into());
+                    }
                 }
             }
-            Ok(_) => {}
             Err(_) => errors.push("join turn events: lock poisoned".into()),
         }
         keep(
@@ -243,6 +248,7 @@ fn run() -> Result<()> {
         Arc::clone(&proj),
     )?;
     let notices = rpc.take_notices()?;
+    let interactions = rpc.take_interactions()?;
     let event_sess = Arc::clone(&sess);
     let app = tauri::Builder::default()
         .manage(cfg)
@@ -253,7 +259,7 @@ fn run() -> Result<()> {
         .manage(spawned.service)
         .manage(Shutdown::default())
         .setup(move |app| {
-            let events = ipc::listen(app.handle().clone(), event_sess, notices)?;
+            let events = ipc::listen(app.handle().clone(), event_sess, notices, interactions)?;
             app.state::<Shutdown>().set_events(events)?;
             Ok(())
         })
@@ -263,7 +269,9 @@ fn run() -> Result<()> {
             key::clear_model_key,
             ipc::session_snapshot,
             ipc::send_message,
-            ipc::stop_turn
+            ipc::stop_turn,
+            ipc::answer_clarify,
+            ipc::cancel_clarify
         ])
         .build(tauri::generate_context!())?;
     app.run(|app, event| {

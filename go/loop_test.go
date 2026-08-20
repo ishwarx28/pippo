@@ -264,6 +264,103 @@ func TestTurnExecutesTaskThroughRuntimeAndContinues(t *testing.T) {
 	}
 }
 
+func TestTurnWaitsForClarificationAndContinuesWithAnswer(t *testing.T) {
+	provider := &clarifyProvider{}
+	state := &state{loop: newLoop(provider)}
+	token, err := readToken(strings.NewReader(validToken + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(routes(&auth{token: token}, state))
+	defer server.Close()
+	questions := make(chan clarifyRequest, 1)
+	answers := make(chan string, 1)
+	chunks := make(chan chunk, 1)
+	closedEvents := make(chan closed, 1)
+	client := dialRPCWith(t, server.URL, validToken, map[string]handler{
+		"runtime.ping": func(context.Context, *rpc, json.RawMessage) (any, error) {
+			return map[string]bool{"ready": true}, nil
+		},
+		"runtime.model_key": func(context.Context, *rpc, json.RawMessage) (any, error) {
+			return map[string]string{"value": "temporary-test-key"}, nil
+		},
+		"runtime.live_env": func(context.Context, *rpc, json.RawMessage) (any, error) {
+			return liveState{Date: "2026-08-20"}, nil
+		},
+		"runtime.clarify": func(ctx context.Context, _ *rpc, raw json.RawMessage) (any, error) {
+			var value clarifyRequest
+			if err := json.Unmarshal(raw, &value); err != nil {
+				return nil, err
+			}
+			questions <- value
+			select {
+			case answer := <-answers:
+				return map[string]string{"answer": answer}, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+		"turn.chunk": func(_ context.Context, _ *rpc, raw json.RawMessage) (any, error) {
+			var value chunk
+			if err := json.Unmarshal(raw, &value); err != nil {
+				return nil, err
+			}
+			chunks <- value
+			return nil, nil
+		},
+		"turn.closed": func(_ context.Context, _ *rpc, raw json.RawMessage) (any, error) {
+			var value closed
+			if err := json.Unmarshal(raw, &value); err != nil {
+				return nil, err
+			}
+			closedEvents <- value
+			return nil, nil
+		},
+	})
+	defer client.close()
+	settings := json.RawMessage(`{
+		"max_parallel_runs":4,"max_background_jobs":4,
+		"max_steps":{"orchestrator":300},"max_depth":3
+	}`)
+	var ready struct {
+		Ready bool `json:"ready"`
+	}
+	if err := client.call(context.Background(), "hello", hello{
+		Paths:    paths{Runtime: "/runtime", Cache: "/cache", Agent: "/agent"},
+		Platform: platform{OS: "test", Arch: "test"}, Settings: settings,
+	}, &ready); err != nil {
+		t.Fatal(err)
+	}
+	id := callID{Turn: "turn-clarify", Request: "request-clarify"}
+	var start accepted
+	if err := client.call(context.Background(), "turn.start", startRequest{
+		callID: id, Query: "add retry",
+	}, &start); err != nil {
+		t.Fatal(err)
+	}
+	question := receive(t, questions)
+	if question.callID != id || question.CallID != "clarify-1" ||
+		question.Question != "Which failures should retry?" || len(question.Options) != 2 ||
+		!question.Options[0].Recommended {
+		t.Fatalf("clarification = %#v", question)
+	}
+	select {
+	case got := <-chunks:
+		t.Fatalf("model continued before the answer: %#v", got)
+	default:
+	}
+	answers <- "Transient failures"
+	if got := receive(t, chunks); got.Text != "I will use transient failures." || got.callID != id {
+		t.Fatalf("chunk = %#v", got)
+	}
+	if got := receive(t, closedEvents); got.Status != "done" || got.callID != id {
+		t.Fatalf("closed = %#v", got)
+	}
+	if provider.err != nil {
+		t.Fatal(provider.err)
+	}
+}
+
 type blockingProvider struct {
 	started chan model.Request
 	mu      sync.Mutex
@@ -276,6 +373,48 @@ type taskProvider struct {
 	err   error
 }
 
+type clarifyProvider struct {
+	mu    sync.Mutex
+	round int
+	err   error
+}
+
+func (p *clarifyProvider) Stream(
+	_ context.Context,
+	key string,
+	request model.Request,
+	yield func(model.Chunk) error,
+) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.round++
+	if key != "temporary-test-key" || len(request.Tools) != 2 ||
+		request.Tools[0].Name != "task" || request.Tools[1].Name != "clarify" {
+		p.err = errors.New("orchestrator tools were not declared in fixed order")
+		return p.err
+	}
+	if p.round == 1 {
+		return yield(model.Chunk{Call: &model.Call{
+			ID: "clarify-1", Name: "clarify", Args: map[string]any{
+				"question": "Which failures should retry?",
+				"options": []any{
+					map[string]any{"label": "Transient failures", "recommended": true},
+					map[string]any{"label": "All failures"},
+				},
+			},
+		}})
+	}
+	if p.round != 2 || len(request.History) != 2 || len(request.History[1].Results) != 1 {
+		p.err = errors.New("clarification result was not returned to the model")
+		return p.err
+	}
+	if answer, _ := request.History[1].Results[0].Data["answer"].(string); answer != "Transient failures" {
+		p.err = errors.New("model did not receive the clarification answer")
+		return p.err
+	}
+	return yield(model.Chunk{Text: "I will use transient failures."})
+}
+
 func (p *taskProvider) Stream(
 	_ context.Context,
 	key string,
@@ -285,8 +424,9 @@ func (p *taskProvider) Stream(
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.round++
-	if key != "temporary-test-key" || len(request.Tools) != 1 || request.Tools[0].Name != "task" {
-		p.err = errors.New("task tool was not declared")
+	if key != "temporary-test-key" || len(request.Tools) != 2 || request.Tools[0].Name != "task" ||
+		request.Tools[1].Name != "clarify" {
+		p.err = errors.New("orchestrator tools were not declared in fixed order")
 		return p.err
 	}
 	if len(request.Blocks) == 0 || request.Blocks[len(request.Blocks)-1].Kind != model.LiveEnvironment {

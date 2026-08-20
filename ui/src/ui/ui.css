@@ -24,6 +24,12 @@
   background: var(--accent);
 }
 
+.button--quiet {
+  border-color: var(--line);
+  color: var(--text);
+  background: var(--bg);
+}
+
 .button--danger {
   color: var(--bad);
   background: var(--bg);
@@ -123,4 +129,37 @@
 .card__footer {
   padding: var(--s3);
   border-top: var(--line-w) solid var(--line);
+}
+
+.sheet-scrim {
+  position: fixed;
+  inset: var(--r);
+  z-index: var(--sheet-layer);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: var(--s4);
+  background: var(--scrim);
+}
+
+.sheet {
+  width: min(var(--full), var(--sheet-width));
+  max-height: var(--sheet-height);
+  padding: var(--s4);
+  overflow-y: auto;
+  border: var(--line-w) solid var(--line);
+  background: var(--surface);
+  animation: sheet-in var(--fast) var(--ease);
+}
+
+.sheet__title {
+  margin: var(--r) var(--r) var(--s4);
+  font: 600 var(--t-lg) var(--sans);
+}
+
+@keyframes sheet-in {
+  from {
+    opacity: var(--pending-opacity);
+    transform: translateY(var(--s1));
+  }
 }

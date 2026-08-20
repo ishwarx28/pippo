@@ -132,6 +132,38 @@
   flex: var(--grow);
 }
 
+.clarify__options {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+  margin-bottom: var(--s4);
+}
+
+.clarify__options .button {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--s3);
+  text-align: left;
+}
+
+.clarify__recommended {
+  font: 400 var(--t-xs) var(--sans);
+}
+
+.clarify__custom,
+.clarify__actions {
+  display: flex;
+  gap: var(--s2);
+}
+
+.clarify__custom {
+  flex-direction: column;
+}
+
+.clarify__actions {
+  justify-content: flex-end;
+}
+
 @keyframes pulse {
   from {
     opacity: var(--pending-opacity);

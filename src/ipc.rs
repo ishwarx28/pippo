@@ -2,7 +2,7 @@
 
 use crate::{
     key::Key,
-    rpc::{Notice, Rpc, Stamped},
+    rpc::{Interaction, Notice, Rpc, Stamped},
     sess::{Call, Message, Sess, Status},
 };
 use anyhow::{Context, Result};
@@ -11,6 +11,7 @@ use std::{collections::BTreeMap, sync::Arc, thread};
 use tauri::{AppHandle, Emitter, State};
 
 const TURN_EVENT: &str = "turn-event";
+const INTERACTION_EVENT: &str = "interaction-event";
 
 #[derive(Serialize)]
 struct StartRequest<'a> {
@@ -70,12 +71,28 @@ pub async fn stop_turn(
         .map_err(message)
 }
 
+#[tauri::command]
+pub fn answer_clarify(
+    rpc: State<'_, Rpc>,
+    id: String,
+    answer: String,
+) -> std::result::Result<(), String> {
+    rpc.answer_clarify(&id, answer).map_err(message)
+}
+
+#[tauri::command]
+pub fn cancel_clarify(rpc: State<'_, Rpc>, id: String) -> std::result::Result<(), String> {
+    rpc.cancel_clarify(&id).map_err(message)
+}
+
 pub fn listen(
     app: AppHandle,
     sess: Arc<Sess>,
     input: std::sync::mpsc::Receiver<Stamped>,
-) -> Result<thread::JoinHandle<()>> {
-    thread::Builder::new()
+    interactions: std::sync::mpsc::Receiver<Interaction>,
+) -> Result<Vec<thread::JoinHandle<()>>> {
+    let interaction_app = app.clone();
+    let turns = thread::Builder::new()
         .name("turn-events".into())
         .spawn(move || {
             let mut next = 1;
@@ -91,7 +108,18 @@ pub fn listen(
                 eprintln!("rpc closed with unordered turn notifications");
             }
         })
-        .context("start turn event listener")
+        .context("start turn event listener")?;
+    let sheets = thread::Builder::new()
+        .name("interaction-events".into())
+        .spawn(move || {
+            while let Ok(event) = interactions.recv() {
+                if let Err(error) = interaction_app.emit(INTERACTION_EVENT, event) {
+                    eprintln!("emit interaction event: {error}");
+                }
+            }
+        })
+        .context("start interaction event listener")?;
+    Ok(vec![turns, sheets])
 }
 
 fn send(app: &AppHandle, sess: &Sess, rpc: &Rpc, text: String) -> Result<Call> {

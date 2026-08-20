@@ -146,7 +146,8 @@ func startTurn(state *state) handler {
 		if err != nil {
 			return nil, err
 		}
-		toolText, err := declarations([]model.Tool{taskTool})
+		tools := []model.Tool{taskTool, clarifyTool}
+		toolText, err := declarations(tools)
 		if err != nil {
 			return nil, err
 		}
@@ -157,7 +158,7 @@ func startTurn(state *state) handler {
 			Transcript:        input.Transcript,
 			Query:             input.Query,
 		})
-		request.Tools = []model.Tool{taskTool}
+		request.Tools = tools
 		runCtx, ok := state.loop.start(ctx, input.callID)
 		if !ok {
 			return nil, errors.New("model request is already running")
@@ -242,7 +243,7 @@ func (l *loop) run(ctx context.Context, peer *rpc, key string, request *model.Re
 		})
 		results := make([]model.Result, 0, len(calls))
 		for _, call := range calls {
-			results = append(results, execTool(ctx, peer, call))
+			results = append(results, execTool(ctx, peer, id, call))
 		}
 		request.History = append(request.History, model.Message{Role: "user", Results: results})
 	}

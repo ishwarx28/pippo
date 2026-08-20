@@ -103,6 +103,34 @@ enum Command {
 }
 
 type Answer = std::result::Result<Value, String>;
+type ClarifyAnswer = std::result::Result<String, String>;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ClarifyOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recommended: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ClarifyPrompt {
+    pub id: String,
+    pub question: String,
+    pub options: Vec<ClarifyOption>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Interaction {
+    ClarifyOpened {
+        prompt: ClarifyPrompt,
+    },
+    ClarifyClosed {
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+}
 
 #[derive(Debug)]
 pub enum Notice {
@@ -125,8 +153,29 @@ pub struct Stamped {
 struct Shared {
     pending: Mutex<Pending>,
     notices: Mutex<Option<mpsc::Sender<Stamped>>>,
+    interactions: Mutex<Option<mpsc::Sender<Interaction>>>,
+    clarify: Mutex<ClarifyState>,
     key: Key,
     proj: Arc<Proj>,
+}
+
+#[derive(Clone, PartialEq)]
+struct ClarifyKey {
+    turn: String,
+    request: String,
+    call: String,
+}
+
+struct ClarifyPending {
+    id: String,
+    key: ClarifyKey,
+    answer: mpsc::SyncSender<ClarifyAnswer>,
+}
+
+#[derive(Default)]
+struct ClarifyState {
+    next: u64,
+    active: Option<ClarifyPending>,
 }
 
 struct Pending {
@@ -139,6 +188,7 @@ struct Inner {
     send: async_mpsc::UnboundedSender<Command>,
     next: AtomicU64,
     notices: Mutex<Option<mpsc::Receiver<Stamped>>>,
+    interactions: Mutex<Option<mpsc::Receiver<Interaction>>>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
@@ -165,12 +215,15 @@ impl Rpc {
 
     fn open(addr: SocketAddr, token: String, key: Key, proj: Arc<Proj>) -> Result<Self> {
         let (notice_send, notice_receive) = mpsc::channel();
+        let (interaction_send, interaction_receive) = mpsc::channel();
         let shared = Arc::new(Shared {
             pending: Mutex::new(Pending {
                 waits: HashMap::new(),
                 closed: false,
             }),
             notices: Mutex::new(Some(notice_send)),
+            interactions: Mutex::new(Some(interaction_send)),
+            clarify: Mutex::new(ClarifyState::default()),
             key,
             proj,
         });
@@ -201,6 +254,7 @@ impl Rpc {
             send,
             next: AtomicU64::new(0),
             notices: Mutex::new(Some(notice_receive)),
+            interactions: Mutex::new(Some(interaction_receive)),
             thread: Mutex::new(Some(handle)),
         });
         match status.recv_timeout(TIMEOUT) {
@@ -259,6 +313,31 @@ impl Rpc {
             .map_err(|_| anyhow::anyhow!("rpc notice lock poisoned"))?
             .take()
             .context("rpc notices already taken")
+    }
+
+    pub fn take_interactions(&self) -> Result<mpsc::Receiver<Interaction>> {
+        self.inner
+            .interactions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("rpc interaction lock poisoned"))?
+            .take()
+            .context("rpc interactions already taken")
+    }
+
+    pub fn answer_clarify(&self, id: &str, answer: String) -> Result<()> {
+        let answer = answer.trim();
+        if answer.is_empty() {
+            anyhow::bail!("clarification answer is empty");
+        }
+        resolve_clarify(&self.inner.shared, id, Ok(answer.to_owned()))
+    }
+
+    pub fn cancel_clarify(&self, id: &str) -> Result<()> {
+        resolve_clarify(
+            &self.inner.shared,
+            id,
+            Err("clarification cancelled".into()),
+        )
     }
 
     pub fn shutdown(&self) -> Result<()> {
@@ -419,6 +498,10 @@ fn dispatch(
     }
     if let Some(method) = input.method {
         let id = input.id;
+        if method == "runtime.clarify" {
+            start_clarify(shared, output, id, input.params);
+            return;
+        }
         let result = match method.as_str() {
             "runtime.ping" => Ok(serde_json::json!({"ready": true})),
             "runtime.model_key" => match shared.key.read() {
@@ -434,6 +517,7 @@ fn dispatch(
             },
             "runtime.task" => task(&shared, input.params),
             "runtime.live_env" => live(&shared, input.params),
+            "runtime.clarify.cancel" => cancel_clarify(&shared, input.params),
             "turn.chunk" => {
                 send_notice(&shared, order, input.params, |value: Chunk| Notice::Chunk {
                     call: value.call,
@@ -478,6 +562,246 @@ fn dispatch(
         }
         Err(_) => eprintln!("rpc pending lock poisoned"),
     }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClarifyInput {
+    turn_id: String,
+    request_id: String,
+    call_id: String,
+    question: String,
+    #[serde(default)]
+    options: Vec<ClarifyOption>,
+}
+
+fn start_clarify(
+    shared: Arc<Shared>,
+    output: async_mpsc::UnboundedSender<Command>,
+    id: Option<u64>,
+    params: Option<Value>,
+) {
+    let Some(id) = id else {
+        return;
+    };
+    let input: ClarifyInput = match serde_json::from_value(params.unwrap_or(Value::Null)) {
+        Ok(input) => input,
+        Err(error) => {
+            respond(
+                output,
+                id,
+                None,
+                Some(Failure {
+                    code: -32602,
+                    message: format!("decode clarify request: {error}"),
+                }),
+            );
+            return;
+        }
+    };
+    if let Err(error) = check_clarify(&input) {
+        respond(output, id, None, Some(error));
+        return;
+    }
+    let (answer, received) = mpsc::sync_channel(1);
+    let prompt = {
+        let mut state = match shared.clarify.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                respond(
+                    output,
+                    id,
+                    None,
+                    Some(Failure {
+                        code: -32603,
+                        message: "clarification lock poisoned".into(),
+                    }),
+                );
+                return;
+            }
+        };
+        if state.active.is_some() {
+            respond(
+                output,
+                id,
+                None,
+                Some(Failure {
+                    code: -32002,
+                    message: "another sheet is already open".into(),
+                }),
+            );
+            return;
+        }
+        state.next += 1;
+        let prompt = ClarifyPrompt {
+            id: format!("clarify_{}", state.next),
+            question: input.question,
+            options: input.options,
+        };
+        state.active = Some(ClarifyPending {
+            id: prompt.id.clone(),
+            key: ClarifyKey {
+                turn: input.turn_id,
+                request: input.request_id,
+                call: input.call_id,
+            },
+            answer,
+        });
+        prompt
+    };
+    if let Err(error) = emit_interaction(
+        &shared,
+        Interaction::ClarifyOpened {
+            prompt: prompt.clone(),
+        },
+    ) {
+        let _ = resolve_clarify(&shared, &prompt.id, Err(error.clone()));
+        respond(
+            output,
+            id,
+            None,
+            Some(Failure {
+                code: -32603,
+                message: error,
+            }),
+        );
+        return;
+    }
+    thread::spawn(move || {
+        let result = match received.recv() {
+            Ok(Ok(answer)) => Ok(serde_json::json!({"answer": answer})),
+            Ok(Err(error)) => Err(Failure {
+                code: -32003,
+                message: error,
+            }),
+            Err(_) => Err(Failure {
+                code: -32603,
+                message: "clarification waiter closed".into(),
+            }),
+        };
+        match result {
+            Ok(value) => respond(output, id, Some(value), None),
+            Err(error) => respond(output, id, None, Some(error)),
+        }
+    });
+}
+
+fn check_clarify(input: &ClarifyInput) -> std::result::Result<(), Failure> {
+    if input.turn_id.trim().is_empty() || input.request_id.trim().is_empty() {
+        return Err(Failure {
+            code: -32602,
+            message: "clarification requires turn and request ids".into(),
+        });
+    }
+    let question = input.question.trim();
+    if question.is_empty() || question.contains(['\r', '\n']) || input.options.len() > 8 {
+        return Err(Failure {
+            code: -32602,
+            message: "clarification question or options are invalid".into(),
+        });
+    }
+    let mut recommended = 0;
+    let mut labels = std::collections::HashSet::new();
+    for option in &input.options {
+        let label = option.label.trim();
+        if label.is_empty()
+            || label.contains(['\r', '\n'])
+            || !labels.insert(label)
+            || option.recommended && {
+                recommended += 1;
+                recommended > 1
+            }
+        {
+            return Err(Failure {
+                code: -32602,
+                message: "clarification options are invalid".into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn cancel_clarify(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
+    let input: ClarifyInput =
+        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
+            code: -32602,
+            message: format!("decode clarification cancellation: {error}"),
+        })?;
+    let key = ClarifyKey {
+        turn: input.turn_id,
+        request: input.request_id,
+        call: input.call_id,
+    };
+    let pending = {
+        let mut state = shared.clarify.lock().map_err(|_| Failure {
+            code: -32603,
+            message: "clarification lock poisoned".into(),
+        })?;
+        match state.active.as_ref().filter(|pending| pending.key == key) {
+            Some(_) => state.active.take(),
+            None => None,
+        }
+    };
+    if let Some(pending) = pending {
+        let id = pending.id;
+        let _ = pending.answer.send(Err("clarification cancelled".into()));
+        let _ = emit_interaction(
+            shared,
+            Interaction::ClarifyClosed {
+                id,
+                error: Some("Clarification cancelled".into()),
+            },
+        );
+    }
+    Ok(serde_json::json!({"cancelled": true}))
+}
+
+fn resolve_clarify(shared: &Shared, id: &str, answer: ClarifyAnswer) -> Result<()> {
+    let pending = {
+        let mut state = shared
+            .clarify
+            .lock()
+            .map_err(|_| anyhow::anyhow!("clarification lock poisoned"))?;
+        match state.active.as_ref().filter(|pending| pending.id == id) {
+            Some(_) => state.active.take(),
+            None => None,
+        }
+    }
+    .context("clarification is no longer active")?;
+    let error = answer.as_ref().err().map(|value| sentence(value));
+    pending
+        .answer
+        .send(answer)
+        .map_err(|_| anyhow::anyhow!("clarification requester stopped waiting"))?;
+    if let Err(error) = emit_interaction(
+        shared,
+        Interaction::ClarifyClosed {
+            id: pending.id,
+            error,
+        },
+    ) {
+        eprintln!("emit clarification close: {error}");
+    }
+    Ok(())
+}
+
+fn sentence(value: &str) -> String {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+fn emit_interaction(shared: &Shared, event: Interaction) -> std::result::Result<(), String> {
+    shared
+        .interactions
+        .lock()
+        .map_err(|_| "rpc interaction lock poisoned".to_string())?
+        .as_ref()
+        .ok_or_else(|| "interaction receiver is closed".to_string())?
+        .send(event)
+        .map_err(|_| "interaction receiver is closed".to_string())
 }
 
 #[derive(Deserialize)]
@@ -641,6 +965,25 @@ fn close_shared(shared: &Shared, error: &str) {
         Ok(mut notices) => notices.take(),
         Err(poisoned) => poisoned.into_inner().take(),
     };
+    let clarify = match shared.clarify.lock() {
+        Ok(mut state) => state.active.take(),
+        Err(poisoned) => poisoned.into_inner().active.take(),
+    };
+    if let Some(pending) = clarify {
+        let id = pending.id;
+        let _ = pending.answer.send(Err(error.into()));
+        let _ = emit_interaction(
+            shared,
+            Interaction::ClarifyClosed {
+                id,
+                error: Some(sentence(error)),
+            },
+        );
+    }
+    match shared.interactions.lock() {
+        Ok(mut interactions) => interactions.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
     for wait in waits {
         if wait.send(Err(error.into())).is_err() {
             eprintln!("rpc caller stopped waiting");
@@ -652,22 +995,33 @@ fn close_shared(shared: &Shared, error: &str) {
 mod tests {
     use super::*;
 
+    fn shared(root: &Path) -> (Shared, mpsc::Receiver<Interaction>) {
+        let (notices, _notice_input) = mpsc::channel();
+        let (interactions, interaction_input) = mpsc::channel();
+        (
+            Shared {
+                pending: Mutex::new(Pending {
+                    waits: HashMap::new(),
+                    closed: false,
+                }),
+                notices: Mutex::new(Some(notices)),
+                interactions: Mutex::new(Some(interactions)),
+                clarify: Mutex::new(ClarifyState::default()),
+                key: Key,
+                proj: Arc::new(Proj::open(root.to_path_buf()).unwrap()),
+            },
+            interaction_input,
+        )
+    }
+
     #[test]
     fn closing_connection_unblocks_pending_callers() {
-        let (notices, _input) = mpsc::channel();
         let (answer, received) = mpsc::sync_channel(1);
         let root =
             std::env::temp_dir().join(format!("pippo-rpc-proj-{}-closing", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let shared = Shared {
-            pending: Mutex::new(Pending {
-                waits: HashMap::from([(7, answer)]),
-                closed: false,
-            }),
-            notices: Mutex::new(Some(notices)),
-            key: Key,
-            proj: Arc::new(Proj::open(root.clone()).unwrap()),
-        };
+        let (shared, interactions) = shared(&root);
+        shared.pending.lock().unwrap().waits.insert(7, answer);
 
         close_shared(&shared, "stopped");
         let error = received.recv().unwrap().unwrap_err();
@@ -675,6 +1029,8 @@ mod tests {
         close_shared(&shared, "stopped again");
         assert!(shared.pending.lock().unwrap().closed);
         assert!(shared.notices.lock().unwrap().is_none());
+        assert!(shared.interactions.lock().unwrap().is_none());
+        assert!(interactions.try_recv().is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -684,16 +1040,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let work = root.join("work");
         std::fs::create_dir_all(&work).unwrap();
-        let (notices, _input) = mpsc::channel();
-        let shared = Shared {
-            pending: Mutex::new(Pending {
-                waits: HashMap::new(),
-                closed: false,
-            }),
-            notices: Mutex::new(Some(notices)),
-            key: Key,
-            proj: Arc::new(Proj::open(root.clone()).unwrap()),
-        };
+        let (shared, _interactions) = shared(&root);
         let created = task(
             &shared,
             Some(serde_json::json!({
@@ -721,6 +1068,133 @@ mod tests {
         .is_ok());
         drop(shared);
         assert!(Proj::open(root.clone()).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clarification_answer_is_correlated_and_only_accepted_once() {
+        let root =
+            std::env::temp_dir().join(format!("pippo-rpc-proj-{}-clarify", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (shared, interactions) = shared(&root);
+        let shared = Arc::new(shared);
+        let (output, mut responses) = async_mpsc::unbounded_channel();
+        start_clarify(
+            Arc::clone(&shared),
+            output,
+            Some(9),
+            Some(serde_json::json!({
+                "turn_id": "turn-a",
+                "request_id": "request-a",
+                "call_id": "call-a",
+                "question": "Which failures should retry?",
+                "options": [
+                    {"label": "Transient failures", "recommended": true},
+                    {"label": "All failures"}
+                ]
+            })),
+        );
+        let prompt = match interactions.recv().unwrap() {
+            Interaction::ClarifyOpened { prompt } => prompt,
+            event => panic!("unexpected event: {event:?}"),
+        };
+        assert_eq!(
+            prompt
+                .options
+                .iter()
+                .filter(|option| option.recommended)
+                .count(),
+            1
+        );
+        resolve_clarify(&shared, &prompt.id, Ok("Transient failures".into())).unwrap();
+        assert!(resolve_clarify(&shared, &prompt.id, Ok("All failures".into())).is_err());
+        assert!(matches!(
+            interactions.recv().unwrap(),
+            Interaction::ClarifyClosed { error: None, .. }
+        ));
+        let Command::Message(text) = responses.blocking_recv().unwrap() else {
+            panic!("clarification response closed the socket")
+        };
+        let response: Wire = serde_json::from_str(&text).unwrap();
+        assert_eq!(response.id, Some(9));
+        assert_eq!(response.result.unwrap()["answer"], "Transient failures");
+        close_shared(&shared, "stopped");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clarification_disconnect_unblocks_waiter() {
+        let root = std::env::temp_dir().join(format!(
+            "pippo-rpc-proj-{}-clarify-close",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let (shared, interactions) = shared(&root);
+        let (answer, received) = mpsc::sync_channel(1);
+        shared.clarify.lock().unwrap().active = Some(ClarifyPending {
+            id: "clarify-test".into(),
+            key: ClarifyKey {
+                turn: "turn-a".into(),
+                request: "request-a".into(),
+                call: "call-a".into(),
+            },
+            answer,
+        });
+        close_shared(&shared, "connection lost");
+        assert_eq!(received.recv().unwrap().unwrap_err(), "connection lost");
+        assert!(matches!(
+            interactions.recv().unwrap(),
+            Interaction::ClarifyClosed {
+                error: Some(error),
+                ..
+            } if error == "Connection lost"
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clarification_cancel_matches_the_originating_call() {
+        let root = std::env::temp_dir().join(format!(
+            "pippo-rpc-proj-{}-clarify-cancel",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let (shared, interactions) = shared(&root);
+        let (answer, received) = mpsc::sync_channel(1);
+        shared.clarify.lock().unwrap().active = Some(ClarifyPending {
+            id: "clarify-test".into(),
+            key: ClarifyKey {
+                turn: "turn-a".into(),
+                request: "request-a".into(),
+                call: "call-a".into(),
+            },
+            answer,
+        });
+        let input = |turn: &str| {
+            Some(serde_json::json!({
+                "turn_id": turn,
+                "request_id": "request-a",
+                "call_id": "call-a",
+                "question": "Continue?"
+            }))
+        };
+        cancel_clarify(&shared, input("turn-b")).unwrap();
+        assert!(shared.clarify.lock().unwrap().active.is_some());
+        assert!(received.try_recv().is_err());
+        cancel_clarify(&shared, input("turn-a")).unwrap();
+        assert_eq!(
+            received.recv().unwrap().unwrap_err(),
+            "clarification cancelled"
+        );
+        assert!(shared.clarify.lock().unwrap().active.is_none());
+        assert!(matches!(
+            interactions.recv().unwrap(),
+            Interaction::ClarifyClosed {
+                error: Some(error),
+                ..
+            } if error == "Clarification cancelled"
+        ));
+        close_shared(&shared, "stopped");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

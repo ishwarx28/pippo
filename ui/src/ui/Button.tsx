@@ -2,7 +2,7 @@
 import { forwardRef, type ButtonHTMLAttributes, type ReactNode } from "react";
 
 type Props = ButtonHTMLAttributes<HTMLButtonElement> & {
-  tone: "primary" | "danger";
+  tone: "primary" | "quiet" | "danger";
   children: ReactNode;
 };
 

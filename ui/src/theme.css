@@ -51,6 +51,9 @@
   --pending-opacity: 0.6;
   --opaque: 1;
   --pulse-time: 1.2s;
+  --sheet-layer: 10;
+  --sheet-width: 640px;
+  --sheet-height: calc(var(--full) - var(--s6));
   --a11y-size: 1px;
   --a11y-offset: -1px;
   color-scheme: light;
