@@ -5,7 +5,7 @@ use crate::{
     key::Key,
     proj::{Proj, TaskStatus},
     sess::{Call, Status},
-    tool::{find, write},
+    tool::{find, shell, write},
 };
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -159,6 +159,7 @@ struct Shared {
     key: Key,
     proj: Arc<Proj>,
     reads: write::Reads,
+    shells: shell::Shells,
 }
 
 #[derive(Clone, PartialEq)]
@@ -229,6 +230,7 @@ impl Rpc {
             key,
             proj,
             reads: write::Reads::default(),
+            shells: shell::Shells::default(),
         });
         let (send, receive) = async_mpsc::unbounded_channel();
         let (started, status) = mpsc::sync_channel(1);
@@ -461,7 +463,11 @@ async fn connection(
                     };
                     let shared = Arc::clone(&read_shared);
                     let output = output.clone();
-                    tokio::spawn(async move { dispatch(shared, output, input, order) });
+                    if input.method.as_deref() == Some("runtime.shell") {
+                        tokio::task::spawn_blocking(move || dispatch(shared, output, input, order));
+                    } else {
+                        tokio::spawn(async move { dispatch(shared, output, input, order) });
+                    }
                 }
                 Message::Close(_) => return Ok(()),
                 _ => {}
@@ -523,6 +529,8 @@ fn dispatch(
             "runtime.find" => find(&shared, input.params),
             "runtime.write" => write(&shared, input.params),
             "runtime.edit" => edit(&shared, input.params),
+            "runtime.shell" => shell(&shared, input.params),
+            "runtime.shell.cancel" => cancel_shell(&shared, input.params),
             "runtime.clarify.cancel" => cancel_clarify(&shared, input.params),
             "turn.chunk" => {
                 send_notice(&shared, order, input.params, |value: Chunk| Notice::Chunk {
@@ -970,6 +978,32 @@ fn edit(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fa
     })
 }
 
+fn shell(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
+    let input: shell::Input =
+        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
+            code: -32602,
+            message: format!("decode shell request: {error}"),
+        })?;
+    let scope = shared
+        .proj
+        .scope(input.task_id.as_deref())
+        .map_err(internal_failure)?;
+    serde_json::to_value(shared.shells.run(&scope, input)).map_err(|error| Failure {
+        code: -32603,
+        message: format!("encode shell result: {error}"),
+    })
+}
+
+fn cancel_shell(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
+    let input: shell::Cancel =
+        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
+            code: -32602,
+            message: format!("decode shell cancellation: {error}"),
+        })?;
+    let cancelled = shared.shells.cancel(input).map_err(tool_failure)?;
+    Ok(serde_json::json!({"cancelled": cancelled}))
+}
+
 fn tool_failure(error: find::Failure) -> Failure {
     Failure {
         code: -32602,
@@ -1054,6 +1088,7 @@ fn fail_all(shared: &Shared, error: String) {
 }
 
 fn close_shared(shared: &Shared, error: &str) {
+    shared.shells.cancel_all();
     let waits = {
         let mut pending = match shared.pending.lock() {
             Ok(pending) => pending,
@@ -1115,6 +1150,7 @@ mod tests {
                 key: Key,
                 proj: Arc::new(Proj::open(root.to_path_buf()).unwrap()),
                 reads: write::Reads::default(),
+                shells: shell::Shells::default(),
             },
             interaction_input,
         )
@@ -1227,6 +1263,42 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(work.join("src/main.rs")).unwrap(),
             "first\nchanged\nlast\n"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shell_requests_execute_in_the_active_task_scope() {
+        let root =
+            std::env::temp_dir().join(format!("pippo-rpc-proj-{}-shell", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let (shared, _interactions) = shared(&root);
+        task(
+            &shared,
+            Some(serde_json::json!({
+                "action": "create", "title": "run project command", "path": work.clone()
+            })),
+        )
+        .unwrap();
+        let result = shell(
+            &shared,
+            Some(serde_json::json!({
+                "turn_id": "run-a", "request_id": "request-a", "call_id": "shell-a",
+                "command": "printf '%s' \"$PWD\"", "env": {"RPC_VALUE": "present"}
+            })),
+        )
+        .unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["kind"], "shell");
+        assert_eq!(result["exit_code"], 0);
+        assert_eq!(
+            result["stdout"],
+            std::fs::canonicalize(&work)
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
         );
         std::fs::remove_dir_all(root).unwrap();
     }

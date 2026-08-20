@@ -128,6 +128,7 @@ pub enum Reason {
     BadArgs,
     Limit,
     Busy,
+    Timeout,
 }
 
 pub struct Outcome {

@@ -10,6 +10,7 @@ mod sess;
 mod store;
 mod tool {
     pub mod find;
+    pub mod shell;
     pub mod write;
 }
 

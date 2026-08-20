@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"pippo/go/model"
@@ -69,6 +70,135 @@ func TestWriteAndEditRequireFlatCompleteArguments(t *testing.T) {
 	if checkEdit(editArgs{Path: "file.txt", Replacement: &content}) == nil ||
 		checkEdit(editArgs{Target: "old", Replacement: &content}) == nil {
 		t.Fatal("edit accepted incomplete arguments")
+	}
+}
+
+func TestShellValidatesCommandTimeoutCwdAndEnvironment(t *testing.T) {
+	zero, tooLong, blank := 0, 381, " "
+	for _, input := range []shellArgs{
+		{},
+		{Command: "true", Timeout: &zero},
+		{Command: "true", Timeout: &tooLong},
+		{Command: "true", Cwd: &blank},
+		{Command: "true", Env: map[string]string{"BAD=NAME": "value"}},
+	} {
+		if checkShell(input) == nil {
+			t.Fatalf("accepted invalid shell arguments: %#v", input)
+		}
+	}
+	timeout, cwd := 30, "subdir"
+	if err := checkShell(shellArgs{
+		Command: "printf '%s' \"$VALUE\"", Timeout: &timeout, Cwd: &cwd,
+		Env: map[string]string{"VALUE": "ok"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestShellDispatchesToRuntimeWithoutJoiningOrchestratorTools(t *testing.T) {
+	provider := &blockingProvider{started: make(chan model.Request, 1)}
+	state := &state{loop: newLoop(provider)}
+	token, err := readToken(strings.NewReader(validToken + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(routes(&auth{token: token}, state))
+	defer server.Close()
+	requests := make(chan shellRequest, 1)
+	client := dialRPCWith(t, server.URL, validToken, map[string]handler{
+		"runtime.shell": func(_ context.Context, _ *rpc, raw json.RawMessage) (any, error) {
+			var input shellRequest
+			if err := json.Unmarshal(raw, &input); err != nil {
+				return nil, err
+			}
+			requests <- input
+			return map[string]any{
+				"ok": true, "kind": "shell", "stdout": "done", "stderr": "", "exit_code": 0,
+			}, nil
+		},
+	})
+	defer client.close()
+	peer := state.connection()
+	if peer == nil {
+		t.Fatal("runtime connection was not attached")
+	}
+	timeout, cwd := 12, "sub"
+	result := execTool(context.Background(), peer,
+		callID{Turn: "run-a", Request: "request-a"}, "t_1234abcd", model.Call{
+			ID: "shell-1", Name: "shell", Args: map[string]any{
+				"command": "printf done", "timeout": timeout, "cwd": cwd,
+				"env": map[string]any{"MODE": "test"},
+			},
+		})
+	request := <-requests
+	if request.Turn != "run-a" || request.Request != "request-a" || request.CallID != "shell-1" ||
+		request.TaskID != "t_1234abcd" || request.Command != "printf done" ||
+		request.Timeout == nil || *request.Timeout != timeout || request.Cwd == nil || *request.Cwd != cwd ||
+		request.Env["MODE"] != "test" {
+		t.Fatalf("runtime request = %#v", request)
+	}
+	if ok, _ := result.Data["ok"].(bool); !ok || result.Data["stdout"] != "done" {
+		t.Fatalf("tool result = %#v", result)
+	}
+	tools, err := declarations([]model.Tool{taskTool, clarifyTool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(tools, `"name":"shell"`) {
+		t.Fatal("shell leaked into the orchestrator tool set")
+	}
+}
+
+func TestShellCancellationNotifiesTheRuntime(t *testing.T) {
+	provider := &blockingProvider{started: make(chan model.Request, 1)}
+	state := &state{loop: newLoop(provider)}
+	token, err := readToken(strings.NewReader(validToken + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(routes(&auth{token: token}, state))
+	defer server.Close()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cancelled := make(chan shellCancel, 1)
+	var once sync.Once
+	client := dialRPCWith(t, server.URL, validToken, map[string]handler{
+		"runtime.shell": func(_ context.Context, _ *rpc, _ json.RawMessage) (any, error) {
+			once.Do(func() { close(started) })
+			<-release
+			return map[string]any{"ok": false}, nil
+		},
+		"runtime.shell.cancel": func(_ context.Context, _ *rpc, raw json.RawMessage) (any, error) {
+			var input shellCancel
+			if err := json.Unmarshal(raw, &input); err != nil {
+				return nil, err
+			}
+			cancelled <- input
+			close(release)
+			return map[string]bool{"cancelled": true}, nil
+		},
+	})
+	defer client.close()
+	peer := state.connection()
+	if peer == nil {
+		t.Fatal("runtime connection was not attached")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan model.Result, 1)
+	go func() {
+		done <- execTool(ctx, peer, callID{Turn: "run-cancel", Request: "request-cancel"}, "task-a", model.Call{
+			ID: "shell-cancel", Name: "shell", Args: map[string]any{"command": "sleep 30"},
+		})
+	}()
+	<-started
+	cancel()
+	result := <-done
+	input := <-cancelled
+	if input.Turn != "run-cancel" || input.Request != "request-cancel" || input.CallID != "shell-cancel" {
+		t.Fatalf("shell cancellation = %#v", input)
+	}
+	if !strings.Contains(result.Data["error"].(string), "context canceled") {
+		t.Fatalf("cancelled result = %#v", result)
 	}
 }
 

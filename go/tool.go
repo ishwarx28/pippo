@@ -109,6 +109,24 @@ var editTool = model.Tool{
 	},
 }
 
+var shellTool = model.Tool{
+	Name:        "shell",
+	Description: "Run a foreground command in its own process group. Relative cwd uses the run's project.",
+	Parameters: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"command":    map[string]any{"type": "string"},
+			"cwd":        map[string]any{"type": "string"},
+			"timeout":    map[string]any{"type": "integer", "minimum": 1, "maximum": 380},
+			"background": map[string]any{"type": "boolean"},
+			"env": map[string]any{
+				"type": "object", "additionalProperties": map[string]any{"type": "string"},
+			},
+		},
+		"required": []string{"command"}, "additionalProperties": false,
+	},
+}
+
 type taskArgs struct {
 	Action string `json:"action"`
 	Title  string `json:"title,omitempty"`
@@ -179,6 +197,26 @@ type editRequest struct {
 	callID
 	TaskID string `json:"task_id,omitempty"`
 	editArgs
+}
+
+type shellArgs struct {
+	Command    string            `json:"command"`
+	Cwd        *string           `json:"cwd,omitempty"`
+	Timeout    *int              `json:"timeout,omitempty"`
+	Background bool              `json:"background,omitempty"`
+	Env        map[string]string `json:"env,omitempty"`
+}
+
+type shellRequest struct {
+	callID
+	CallID string `json:"call_id"`
+	TaskID string `json:"task_id,omitempty"`
+	shellArgs
+}
+
+type shellCancel struct {
+	callID
+	CallID string `json:"call_id"`
 }
 
 func declarations(tools []model.Tool) (string, error) {
@@ -274,10 +312,44 @@ func execTool(ctx context.Context, peer *rpc, id callID, taskID string, call mod
 		} else {
 			result.Data = output
 		}
+	case shellTool.Name:
+		var args shellArgs
+		if err := decodeArgs(call.Args, &args); err != nil || checkShell(args) != nil {
+			result.Data = map[string]any{"error": "invalid shell arguments"}
+			return result
+		}
+		input := shellRequest{callID: id, CallID: call.ID, TaskID: taskID, shellArgs: args}
+		var output map[string]any
+		if err := peer.call(ctx, "runtime.shell", input, &output); err != nil {
+			if ctx.Err() != nil {
+				_ = peer.notify("runtime.shell.cancel", shellCancel{callID: id, CallID: call.ID})
+			}
+			result.Data = map[string]any{"error": err.Error()}
+		} else {
+			result.Data = output
+		}
 	default:
 		result.Data = map[string]any{"error": "unknown tool"}
 	}
 	return result
+}
+
+func checkShell(args shellArgs) error {
+	if strings.TrimSpace(args.Command) == "" || strings.ContainsRune(args.Command, 0) {
+		return errors.New("shell requires a valid command")
+	}
+	if args.Cwd != nil && (strings.TrimSpace(*args.Cwd) == "" || strings.ContainsRune(*args.Cwd, 0)) {
+		return errors.New("shell cwd is invalid")
+	}
+	if args.Timeout != nil && (*args.Timeout < 1 || *args.Timeout > 380) {
+		return errors.New("shell timeout is outside its limit")
+	}
+	for name, value := range args.Env {
+		if name == "" || strings.ContainsAny(name, "=\x00") || strings.ContainsRune(value, 0) {
+			return errors.New("shell environment is invalid")
+		}
+	}
+	return nil
 }
 
 func checkWrite(args writeArgs) error {
