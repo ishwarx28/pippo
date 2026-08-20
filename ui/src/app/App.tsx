@@ -46,8 +46,17 @@ type Closed = {
 };
 
 type TurnEvent = Opened | Chunk | Closed;
+type MessageAction = TurnEvent | { kind: "hydrate"; messages: Message[] };
 
-function applyEvent(messages: Message[], event: TurnEvent): Message[] {
+function applyEvent(messages: Message[], event: MessageAction): Message[] {
+  if (event.kind === "hydrate") {
+    const live = new Map(messages.map((message) => [message.id, message]));
+    const stored = new Set(event.messages.map((message) => message.id));
+    return [
+      ...event.messages.map((message) => live.get(message.id) ?? message),
+      ...messages.filter((message) => !stored.has(message.id)),
+    ];
+  }
   if (event.kind === "opened") {
     const ids = new Set([event.user.id, event.assistant.id]);
     return [...messages.filter((message) => !ids.has(message.id)), event.user, event.assistant];
@@ -84,32 +93,39 @@ export function App() {
   useEffect(() => {
     let active = true;
     let stop: (() => void) | undefined;
-    void listen<TurnEvent>("turn-event", ({ payload }) => {
-      if (!active) return;
-      dispatch(payload);
-      if (payload.kind === "opened") {
-        opened.current += 1;
-        setDraft("");
-        setError(undefined);
-        setAnnouncement("Turn started");
-      } else if (payload.kind === "closed") {
-        setStopping(false);
-        setAnnouncement(
-          payload.status === "done"
-            ? "Reply complete"
-            : payload.status === "cancelled"
-              ? "Turn stopped"
-              : "Turn failed",
-        );
+    async function hydrate() {
+      try {
+        const unlisten = await listen<TurnEvent>("turn-event", ({ payload }) => {
+          if (!active) return;
+          dispatch(payload);
+          if (payload.kind === "opened") {
+            opened.current += 1;
+            setDraft("");
+            setError(undefined);
+            setAnnouncement("Turn started");
+          } else if (payload.kind === "closed") {
+            setStopping(false);
+            setAnnouncement(
+              payload.status === "done"
+                ? "Reply complete"
+                : payload.status === "cancelled"
+                  ? "Turn stopped"
+                  : "Turn failed",
+            );
+          }
+        });
+        if (!active) {
+          unlisten();
+          return;
+        }
+        stop = unlisten;
+        const messages = await invoke<Message[]>("session_snapshot");
+        if (active) dispatch({ kind: "hydrate", messages });
+      } catch (reason) {
+        if (active) setError(`Could not restore the conversation: ${detail(reason)}`);
       }
-    })
-      .then((unlisten) => {
-        if (active) stop = unlisten;
-        else unlisten();
-      })
-      .catch((reason: unknown) => {
-        if (active) setError(`Could not listen for replies: ${detail(reason)}`);
-      });
+    }
+    void hydrate();
     return () => {
       active = false;
       stop?.();

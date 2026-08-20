@@ -2,7 +2,7 @@
 
 use crate::{
     rpc::{Notice, Rpc, Stamped},
-    sess::{Call, Sess, Status},
+    sess::{Call, Message, Sess, Status},
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,11 @@ struct Accepted {
 #[derive(Deserialize)]
 struct Cancelled {
     cancelled: bool,
+}
+
+#[tauri::command]
+pub fn session_snapshot(sess: State<'_, Arc<Sess>>) -> std::result::Result<Vec<Message>, String> {
+    sess.snapshot().map_err(message)
 }
 
 #[tauri::command]

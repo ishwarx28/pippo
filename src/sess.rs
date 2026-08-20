@@ -239,8 +239,7 @@ impl Sess {
         Ok(Some(event))
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn messages(&self) -> Result<Vec<Message>> {
+    pub fn snapshot(&self) -> Result<Vec<Message>> {
         Ok(self.lock()?.messages.clone())
     }
 
@@ -320,7 +319,7 @@ mod tests {
             .close(&start.call, Status::Done, None)
             .unwrap()
             .unwrap();
-        let messages = session.messages().unwrap();
+        let messages = session.snapshot().unwrap();
         assert_eq!(messages[0].text, "hello");
         assert_eq!(messages[1].text, "one two");
         assert_eq!(messages[1].status, Some(Status::Done));
@@ -395,13 +394,59 @@ mod tests {
             None
         );
         session.chunk(&second.call, "current".into()).unwrap();
-        let messages = session.messages().unwrap();
+        let messages = session.snapshot().unwrap();
         assert_eq!(messages[1].text, "kept");
         assert_eq!(messages[3].text, "current");
         assert_eq!(messages[3].status, Some(Status::Running));
 
         let store = Store::open(root.clone()).unwrap();
         assert_eq!(store.messages::<Event>().unwrap().len(), 5);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restores_message_projection_from_replay() {
+        let root = root();
+        let messages = vec![
+            Message {
+                id: "message-user".into(),
+                turn_id: "turn-one".into(),
+                role: Role::User,
+                text: "Keep this exactly.".into(),
+                status: None,
+                error: None,
+            },
+            Message {
+                id: "message-done".into(),
+                turn_id: "turn-one".into(),
+                role: Role::Assistant,
+                text: "It is kept.".into(),
+                status: Some(Status::Done),
+                error: None,
+            },
+            Message {
+                id: "message-failed".into(),
+                turn_id: "turn-two".into(),
+                role: Role::Assistant,
+                text: "Partial reply".into(),
+                status: Some(Status::Failed),
+                error: Some("connection closed".into()),
+            },
+            Message {
+                id: "message-cancelled".into(),
+                turn_id: "turn-three".into(),
+                role: Role::Assistant,
+                text: "Stopped reply".into(),
+                status: Some(Status::Cancelled),
+                error: None,
+            },
+        ];
+        let store = Store::open(root.clone()).unwrap();
+        store.replace_replay(&messages).unwrap();
+        drop(store);
+
+        let restored = session(&root);
+        assert_eq!(restored.snapshot().unwrap(), messages);
         fs::remove_dir_all(root).unwrap();
     }
 }

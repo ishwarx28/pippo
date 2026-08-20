@@ -154,6 +154,7 @@ fn run() -> Result<()> {
             key::model_key_status,
             key::store_model_key,
             key::clear_model_key,
+            ipc::session_snapshot,
             ipc::send_message,
             ipc::stop_turn
         ])
