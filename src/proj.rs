@@ -1,12 +1,13 @@
 // Owns project registration and durable task state.
 
+use crate::store::atomic;
 use anyhow::{Context, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
-    fs::{self, File},
+    fs,
     path::{Component, Path, PathBuf},
     process::Command,
     sync::{Mutex, MutexGuard},
@@ -259,6 +260,19 @@ impl Proj {
         })
     }
 
+    pub fn task(&self, id: &str) -> Result<Task> {
+        let state = self.lock()?;
+        if state.meta.active_task.as_deref() != Some(id) {
+            anyhow::bail!("task {id} is not active");
+        }
+        state
+            .meta
+            .tasks
+            .get(id)
+            .cloned()
+            .with_context(|| format!("task {id} is not registered"))
+    }
+
     pub fn live(&self, task_id: Option<&str>) -> Result<Live> {
         let (task, project, projects) = {
             let state = self.lock()?;
@@ -309,7 +323,7 @@ impl Proj {
     }
 
     fn save(&self, meta: &SessionMeta) -> Result<()> {
-        atomic_json(&self.root.join("session/meta.json"), meta)
+        atomic(&self.root.join("session/meta.json"), meta)
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, State>> {
@@ -380,26 +394,7 @@ fn create_project(root: &Path, project: &Project) -> Result<()> {
     if !prefs.exists() {
         fs::write(&prefs, b"").with_context(|| format!("create {}", prefs.display()))?;
     }
-    atomic_json(&dir.join("meta.json"), project)
-}
-
-fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
-    let parent = path.parent().context("state file has no parent")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create state directory {}", parent.display()))?;
-    let tmp = path.with_extension("json.tmp");
-    let mut bytes = serde_json::to_vec_pretty(value).context("serialize state")?;
-    bytes.push(b'\n');
-    fs::write(&tmp, bytes).with_context(|| format!("write state temp {}", tmp.display()))?;
-    File::open(&tmp)
-        .with_context(|| format!("open state temp {}", tmp.display()))?
-        .sync_all()
-        .with_context(|| format!("flush state temp {}", tmp.display()))?;
-    fs::rename(&tmp, path).with_context(|| format!("replace state {}", path.display()))?;
-    File::open(parent)
-        .with_context(|| format!("open state directory {}", parent.display()))?
-        .sync_all()
-        .with_context(|| format!("flush state directory {}", parent.display()))
+    atomic(&dir.join("meta.json"), project)
 }
 
 fn project(path: &Path) -> Result<Project> {

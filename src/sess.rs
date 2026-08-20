@@ -1,12 +1,319 @@
 // Owns turn state, durable message transitions and live context.
 
-use crate::store::Store;
+use crate::store::{atomic, replace, Store};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     fmt::Write as _,
+    fs::{self, File},
+    path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunStatus {
+    Running,
+    Paused,
+    Done,
+    Failed,
+    Stopped,
+    Interrupted,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RunRole {
+    Planner,
+    Explorer,
+    Worker,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RunMeta {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    pub role: RunRole,
+    pub title: String,
+    pub request: String,
+    pub constraints: Vec<String>,
+    pub media: Vec<u16>,
+    pub related: Vec<String>,
+    pub highlight: Vec<PathBuf>,
+    pub status: RunStatus,
+    pub attempt: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report_path: Option<PathBuf>,
+}
+
+pub struct RunCreate {
+    pub parent_id: Option<String>,
+    pub task_id: Option<String>,
+    pub project_id: Option<String>,
+    pub role: RunRole,
+    pub title: String,
+    pub request: String,
+    pub constraints: Vec<String>,
+    pub media: Vec<u16>,
+    pub related: Vec<String>,
+    pub highlight: Vec<PathBuf>,
+}
+
+struct RunEntry {
+    meta: RunMeta,
+    path: Option<PathBuf>,
+}
+
+pub struct Runs {
+    root: PathBuf,
+    projects: PathBuf,
+    entries: Mutex<BTreeMap<String, RunEntry>>,
+}
+
+impl Runs {
+    pub fn open(root: PathBuf) -> Result<Self> {
+        let runs = root.join("session/runs");
+        fs::create_dir_all(&runs)
+            .with_context(|| format!("create runs directory {}", runs.display()))?;
+        let mut entries = BTreeMap::new();
+        load_runs(&runs, None, &mut entries)?;
+        Ok(Self {
+            root: runs,
+            projects: root.join("projects"),
+            entries: Mutex::new(entries),
+        })
+    }
+
+    pub fn create(&self, input: RunCreate) -> Result<RunMeta> {
+        let title = input.title.trim();
+        let request = input.request.trim();
+        if title.is_empty() || title.contains(['\r', '\n', '/', '\0']) || request.is_empty() {
+            anyhow::bail!("run title and request are required");
+        }
+        let mut entries = self.lock()?;
+        if input.task_id.is_none()
+            && (input.role != RunRole::Explorer
+                || input.parent_id.is_some()
+                || input.project_id.is_some())
+        {
+            anyhow::bail!("only a root explorer scout may omit its task");
+        }
+        if let Some(parent_id) = input.parent_id.as_deref() {
+            let parent = entries
+                .get(parent_id)
+                .with_context(|| format!("parent run {parent_id} is not registered"))?;
+            if parent.meta.task_id != input.task_id || parent.meta.project_id != input.project_id {
+                anyhow::bail!("child run must keep its parent's task and project");
+            }
+        }
+        let id = loop {
+            let id = run_id()?;
+            if !entries.contains_key(&id) {
+                break id;
+            }
+        };
+        let meta = RunMeta {
+            id: id.clone(),
+            parent_id: input.parent_id.clone(),
+            task_id: input.task_id,
+            project_id: input.project_id,
+            role: input.role,
+            title: title.into(),
+            request: request.into(),
+            constraints: input.constraints,
+            media: input.media,
+            related: input.related,
+            highlight: input.highlight,
+            status: RunStatus::Running,
+            attempt: 1,
+            report_path: None,
+        };
+        let base = match input.parent_id.as_deref() {
+            Some(parent) => entries[parent]
+                .path
+                .as_ref()
+                .context("a scout cannot own child runs")?
+                .join("runs"),
+            None => self.root.clone(),
+        };
+        let path = meta
+            .task_id
+            .as_ref()
+            .map(|_| create_run(&base, &meta))
+            .transpose()?;
+        entries.insert(
+            id,
+            RunEntry {
+                meta: meta.clone(),
+                path,
+            },
+        );
+        Ok(meta)
+    }
+
+    pub fn update(
+        &self,
+        id: &str,
+        status: RunStatus,
+        attempt: u32,
+        report: Option<String>,
+    ) -> Result<RunMeta> {
+        let mut entries = self.lock()?;
+        let entry = entries
+            .get_mut(id)
+            .with_context(|| format!("run {id} is not registered"))?;
+        let valid = match (entry.meta.status, status) {
+            (RunStatus::Running, RunStatus::Paused | RunStatus::Done | RunStatus::Failed)
+            | (RunStatus::Running, RunStatus::Stopped | RunStatus::Interrupted)
+            | (
+                RunStatus::Paused,
+                RunStatus::Running | RunStatus::Stopped | RunStatus::Interrupted,
+            ) => attempt == entry.meta.attempt,
+            (
+                RunStatus::Done | RunStatus::Failed | RunStatus::Stopped | RunStatus::Interrupted,
+                RunStatus::Running,
+            ) => attempt == entry.meta.attempt + 1,
+            _ => false,
+        };
+        if !valid {
+            anyhow::bail!("invalid run transition for {id}");
+        }
+        let mut next = entry.meta.clone();
+        next.status = status;
+        next.attempt = attempt;
+        if let (Some(report), Some(project), Some(task)) =
+            (report, next.project_id.as_deref(), next.task_id.as_deref())
+        {
+            let mut name = next.title.split_whitespace().collect::<Vec<_>>().join("_");
+            if attempt > 1 {
+                write!(name, "_({attempt})").context("version report name")?;
+            }
+            name.push_str(".md");
+            let relative = PathBuf::from("projects")
+                .join(project)
+                .join("reports")
+                .join(task)
+                .join(name);
+            let path = self
+                .projects
+                .parent()
+                .context("runtime root is missing")?
+                .join(&relative);
+            if path.exists() {
+                anyhow::bail!("report version already exists for run {id}");
+            }
+            replace(&path, report.as_bytes())?;
+            next.report_path = Some(relative);
+        }
+        if let Some(path) = entry.path.as_ref() {
+            atomic(&path.join("meta.json"), &next)?;
+        }
+        entry.meta = next.clone();
+        Ok(next)
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> Result<Vec<(RunMeta, Option<PathBuf>)>> {
+        Ok(self
+            .lock()?
+            .values()
+            .map(|entry| (entry.meta.clone(), entry.path.clone()))
+            .collect())
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, BTreeMap<String, RunEntry>>> {
+        self.entries
+            .lock()
+            .map_err(|_| anyhow::anyhow!("run state lock poisoned"))
+    }
+}
+
+fn create_run(base: &Path, meta: &RunMeta) -> Result<PathBuf> {
+    fs::create_dir_all(base).with_context(|| format!("create run parent {}", base.display()))?;
+    let path = base.join(&meta.id);
+    let temp = base.join(format!(".{}.tmp", meta.id));
+    fs::create_dir(&temp).with_context(|| format!("create run directory {}", temp.display()))?;
+    fs::create_dir(temp.join("runs"))
+        .with_context(|| format!("create child runs directory {}", temp.display()))?;
+    atomic(&temp.join("meta.json"), meta)?;
+    for (name, bytes) in [("messages.jsonl", b"".as_slice()), ("replay.json", b"[]\n")] {
+        let file = temp.join(name);
+        fs::write(&file, bytes).with_context(|| format!("create run file {}", file.display()))?;
+        File::open(&file)
+            .with_context(|| format!("open run file {}", file.display()))?
+            .sync_all()
+            .with_context(|| format!("flush run file {}", file.display()))?;
+    }
+    fs::rename(&temp, &path).with_context(|| format!("publish run {}", path.display()))?;
+    File::open(base)
+        .with_context(|| format!("open run parent {}", base.display()))?
+        .sync_all()
+        .with_context(|| format!("flush run parent {}", base.display()))?;
+    Ok(path)
+}
+
+fn load_runs(
+    root: &Path,
+    parent: Option<&str>,
+    entries: &mut BTreeMap<String, RunEntry>,
+) -> Result<()> {
+    let mut paths = fs::read_dir(root)
+        .with_context(|| format!("read runs directory {}", root.display()))?
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort_by_key(|entry| entry.file_name());
+    for entry in paths {
+        if !entry.file_type()?.is_dir() || entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let file = path.join("meta.json");
+        let mut meta: RunMeta = serde_json::from_slice(
+            &fs::read(&file).with_context(|| format!("read run state {}", file.display()))?,
+        )
+        .with_context(|| format!("parse run state {}", file.display()))?;
+        if !valid_run_id(&meta.id)
+            || entry.file_name().to_string_lossy() != meta.id
+            || meta.parent_id.as_deref() != parent
+            || entries.contains_key(&meta.id)
+        {
+            anyhow::bail!("invalid run state {}", file.display());
+        }
+        if meta.status == RunStatus::Running {
+            meta.status = RunStatus::Interrupted;
+            atomic(&file, &meta)?;
+        }
+        let id = meta.id.clone();
+        entries.insert(
+            id.clone(),
+            RunEntry {
+                meta,
+                path: Some(path.clone()),
+            },
+        );
+        load_runs(&path.join("runs"), Some(&id), entries)?;
+    }
+    Ok(())
+}
+
+fn run_id() -> Result<String> {
+    let mut bytes = [0_u8; 4];
+    getrandom::fill(&mut bytes).map_err(|error| anyhow::anyhow!("generate run id: {error}"))?;
+    let mut id = String::from("r_");
+    for byte in bytes {
+        write!(id, "{byte:02x}").context("encode run id")?;
+    }
+    Ok(id)
+}
+
+fn valid_run_id(id: &str) -> bool {
+    id.len() == 10 && id.starts_with("r_") && id[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Call {
@@ -315,6 +622,10 @@ fn id(prefix: &str) -> Result<String> {
     }
     Ok(value)
 }
+
+#[cfg(test)]
+#[path = "sess_run_test.rs"]
+mod run_tests;
 
 #[cfg(test)]
 mod tests {

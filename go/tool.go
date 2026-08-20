@@ -30,6 +30,31 @@ var taskTool = model.Tool{
 	},
 }
 
+var subagentTool = model.Tool{
+	Name:        "subagent",
+	Description: "Spawn or control a planner, explorer, or worker run.",
+	Parameters: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"action":      map[string]any{"type": "string", "enum": []string{"spawn", "wait", "pause", "resume", "stop"}},
+			"role":        map[string]any{"type": "string", "enum": []string{"planner", "explorer", "worker"}},
+			"task_id":     map[string]any{"type": "string"},
+			"title":       map[string]any{"type": "string"},
+			"request":     map[string]any{"type": "string"},
+			"constraints": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"media":       map[string]any{"type": "array", "items": map[string]any{"type": "integer", "minimum": 1}},
+			"related":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"highlight":   map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"wait":        map[string]any{"type": "boolean"},
+			"id":          map[string]any{"type": "string"},
+			"ids":         map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"answers":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"amend":       map[string]any{"type": "string"},
+		},
+		"required": []string{"action"}, "additionalProperties": false,
+	},
+}
+
 var clarifyTool = model.Tool{
 	Name: "clarify",
 	Description: "Ask the user one outcome-changing question and wait for their answer. " +
@@ -136,6 +161,23 @@ type taskArgs struct {
 	Note   string `json:"note,omitempty"`
 }
 
+type subagentArgs struct {
+	Action      string   `json:"action"`
+	Role        string   `json:"role,omitempty"`
+	TaskID      string   `json:"task_id,omitempty"`
+	Title       string   `json:"title,omitempty"`
+	Request     string   `json:"request,omitempty"`
+	Constraints []string `json:"constraints,omitempty"`
+	Media       []int    `json:"media,omitempty"`
+	Related     []string `json:"related,omitempty"`
+	Highlight   []string `json:"highlight,omitempty"`
+	Wait        bool     `json:"wait,omitempty"`
+	ID          string   `json:"id,omitempty"`
+	IDs         []string `json:"ids,omitempty"`
+	Answers     []string `json:"answers,omitempty"`
+	Amend       string   `json:"amend,omitempty"`
+}
+
 type clarifyOption struct {
 	Label       string `json:"label"`
 	Recommended bool   `json:"recommended,omitempty"`
@@ -234,7 +276,15 @@ func declarations(tools []model.Tool) (string, error) {
 	return strings.Join(lines, "\n"), nil
 }
 
-func execTool(ctx context.Context, peer *rpc, role string, id callID, taskID string, call model.Call) model.Result {
+func execTool(
+	ctx context.Context,
+	peer *rpc,
+	agents *runSet,
+	role string,
+	id callID,
+	taskID string,
+	call model.Call,
+) model.Result {
 	result := model.Result{ID: call.ID, Name: call.Name}
 	switch call.Name {
 	case taskTool.Name:
@@ -249,6 +299,26 @@ func execTool(ctx context.Context, peer *rpc, role string, id callID, taskID str
 		}
 		var output map[string]any
 		if err := peer.call(ctx, "runtime.task", args, &output); err != nil {
+			result.Data = map[string]any{"error": err.Error()}
+		} else {
+			result.Data = map[string]any{"output": output}
+		}
+	case subagentTool.Name:
+		var args subagentArgs
+		if err := decodeArgs(call.Args, &args); err != nil || checkSubagent(args) != nil {
+			result.Data = map[string]any{"error": "invalid subagent arguments"}
+			return result
+		}
+		if agents == nil {
+			result.Data = map[string]any{"error": "subagent lifecycle is unavailable"}
+			return result
+		}
+		caller := ""
+		if role == "planner" {
+			caller = id.Turn
+		}
+		output, err := agents.act(ctx, peer, role, caller, taskID, args)
+		if err != nil {
 			result.Data = map[string]any{"error": err.Error()}
 		} else {
 			result.Data = map[string]any{"output": output}
@@ -432,6 +502,74 @@ func checkTask(args taskArgs) error {
 		}
 	default:
 		return fmt.Errorf("invalid task action %q", args.Action)
+	}
+	return nil
+}
+
+func checkSubagent(args subagentArgs) error {
+	spawn := args.Role != "" || args.TaskID != "" || args.Title != "" || args.Request != "" ||
+		len(args.Constraints) != 0 || len(args.Media) != 0 || len(args.Related) != 0 ||
+		len(args.Highlight) != 0 || args.Wait
+	control := args.ID != "" || len(args.IDs) != 0 || len(args.Answers) != 0 || args.Amend != ""
+	switch args.Action {
+	case "spawn":
+		if control || !spawn {
+			return errors.New("spawn accepts only run request fields")
+		}
+	case "wait":
+		if spawn || args.ID != "" || len(args.IDs) == 0 || len(args.Answers) != 0 || args.Amend != "" {
+			return errors.New("wait requires only run ids")
+		}
+	case "pause", "stop":
+		if spawn || args.ID == "" || len(args.IDs) != 0 || len(args.Answers) != 0 || args.Amend != "" {
+			return fmt.Errorf("%s requires only one run id", args.Action)
+		}
+	case "resume":
+		if spawn || args.ID == "" || len(args.IDs) != 0 {
+			return errors.New("resume requires a run id and optional answers or amendment")
+		}
+	default:
+		return fmt.Errorf("invalid subagent action %q", args.Action)
+	}
+	return nil
+}
+
+func checkSpawn(callerRole, callerTask string, args subagentArgs) error {
+	if args.Role != "planner" && args.Role != "explorer" && args.Role != "worker" {
+		return errors.New("spawn requires a planner, explorer, or worker role")
+	}
+	if callerRole == "planner" && args.Role == "planner" {
+		return errors.New("a planner cannot spawn another planner")
+	}
+	if strings.TrimSpace(args.Title) == "" || strings.ContainsAny(args.Title, "\r\n") ||
+		strings.TrimSpace(args.Request) == "" {
+		return errors.New("spawn requires a plain title and request")
+	}
+	if args.TaskID == "" {
+		if callerRole != "orchestrator" || args.Role != "explorer" {
+			return errors.New("only an orchestrator scout explorer may omit the task")
+		}
+	} else if len(args.TaskID) != 10 || !strings.HasPrefix(args.TaskID, "t_") {
+		return errors.New("spawn task id is invalid")
+	}
+	if callerRole == "planner" && args.TaskID != callerTask {
+		return errors.New("a planner must reuse its task")
+	}
+	for _, values := range [][]string{args.Constraints, args.Related, args.Highlight} {
+		seen := make(map[string]bool, len(values))
+		for _, value := range values {
+			if strings.TrimSpace(value) == "" || seen[value] {
+				return errors.New("spawn list values must be non-empty and unique")
+			}
+			seen[value] = true
+		}
+	}
+	seenMedia := make(map[int]bool, len(args.Media))
+	for _, number := range args.Media {
+		if number < 1 || seenMedia[number] {
+			return errors.New("spawn media numbers must be positive and unique")
+		}
+		seenMedia[number] = true
 	}
 	return nil
 }

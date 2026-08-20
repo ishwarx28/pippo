@@ -17,6 +17,10 @@ func TestFormatLiveUsesFixedOrderAndSortedSets(t *testing.T) {
 			{ID: "z_222222", Path: "/work/z"},
 			{ID: "a_111111", Path: "/work/a"},
 		},
+		Runs: []liveRun{
+			{ID: "r_22222222", Role: "worker", Title: "second", Status: runPaused, Order: 2},
+			{ID: "r_11111111", Role: "explorer", Title: "first", Status: runRunning, Order: 1},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -34,6 +38,9 @@ func TestFormatLiveUsesFixedOrderAndSortedSets(t *testing.T) {
 		"known projects:",
 		"  a_111111 · /work/a",
 		"  z_222222 · /work/z",
+		"open runs:",
+		"  r_11111111 · running · explorer · first",
+		"  r_22222222 · paused · worker · second",
 	}, "\n")
 	if text != want {
 		t.Fatalf("live environment:\n%s\nwant:\n%s", text, want)

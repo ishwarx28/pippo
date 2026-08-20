@@ -20,6 +20,7 @@ fn shared(root: &Path) -> (Shared, mpsc::Receiver<Interaction>) {
             sheet: Mutex::new(SheetState::default()),
             key: Key,
             proj: Arc::new(Proj::open(root.to_path_buf()).unwrap()),
+            runs: Runs::open(root.to_path_buf()).unwrap(),
             rules: rule::Book::open(root, root).unwrap(),
             reads: write::Reads::default(),
             shells: shell::Shells::default(),
@@ -81,6 +82,83 @@ fn task_requests_reach_durable_project_state() {
     .is_ok());
     drop(shared);
     assert!(Proj::open(root.clone()).is_ok());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn run_requests_create_nested_durable_directories() {
+    let root = std::env::temp_dir().join(format!("pippo-rpc-proj-{}-run", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let (shared, _interactions) = shared(&root);
+    let task_reply = task(
+        &shared,
+        Some(serde_json::json!({
+            "action": "create", "title": "coordinate nested work", "path": work
+        })),
+    )
+    .unwrap();
+    let task_id = task_reply["task_id"].as_str().unwrap();
+    let parent = run(
+        &shared,
+        Some(serde_json::json!({
+            "action": "create", "task_id": task_id, "role": "planner",
+            "title": "map the change", "request": "Locate the required work.",
+            "constraints": ["read only"], "media": [1], "related": [], "highlight": []
+        })),
+    )
+    .unwrap();
+    let parent_id = parent["id"].as_str().unwrap();
+    let child = run(
+        &shared,
+        Some(serde_json::json!({
+            "action": "create", "parent_id": parent_id, "task_id": task_id,
+            "role": "explorer", "title": "inspect implementation",
+            "request": "Inspect the current implementation."
+        })),
+    )
+    .unwrap();
+    let child_id = child["id"].as_str().unwrap();
+    let parent_dir = root.join("session/runs").join(parent_id);
+    let child_dir = parent_dir.join("runs").join(child_id);
+    assert!(parent_dir.join("meta.json").is_file());
+    assert!(child_dir.join("messages.jsonl").is_file());
+    let done = run(
+        &shared,
+        Some(serde_json::json!({
+            "action": "update", "id": child_id, "status": "done", "attempt": 1,
+            "report": "verified child report"
+        })),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join(done["report_path"].as_str().unwrap())).unwrap(),
+        "verified child report"
+    );
+    assert!(run(
+        &shared,
+        Some(serde_json::json!({
+            "action": "create", "parent_id": parent_id, "task_id": "t_ffffffff",
+            "role": "worker", "title": "wrong task", "request": "Do not run."
+        }))
+    )
+    .is_err());
+    task(
+        &shared,
+        Some(serde_json::json!({
+            "action": "update", "id": task_id, "status": "done", "note": "work complete"
+        })),
+    )
+    .unwrap();
+    assert!(run(
+        &shared,
+        Some(serde_json::json!({
+            "action": "create", "task_id": task_id, "role": "worker",
+            "title": "closed task", "request": "Do not run."
+        }))
+    )
+    .is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
 

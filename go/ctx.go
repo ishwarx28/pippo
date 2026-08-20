@@ -27,6 +27,14 @@ type liveProject struct {
 	Path string `json:"path"`
 }
 
+type liveRun struct {
+	ID     string    `json:"run_id"`
+	Role   string    `json:"role"`
+	Title  string    `json:"title"`
+	Status runStatus `json:"status"`
+	Order  uint64    `json:"-"`
+}
+
 type liveState struct {
 	Date     string        `json:"date"`
 	Task     *liveTask     `json:"task,omitempty"`
@@ -34,12 +42,16 @@ type liveState struct {
 	Git      []string      `json:"git,omitempty"`
 	Agents   []string      `json:"agents"`
 	Projects []liveProject `json:"projects"`
+	Runs     []liveRun     `json:"-"`
 }
 
-func refreshLive(ctx context.Context, peer *rpc, request *model.Request, taskID string) error {
+func refreshLive(ctx context.Context, peer *rpc, request *model.Request, taskID string, runs *runSet) error {
 	var state liveState
 	if err := peer.call(ctx, "runtime.live_env", liveRequest{TaskID: taskID}, &state); err != nil {
 		return fmt.Errorf("load live environment: %w", err)
+	}
+	if runs != nil {
+		state.Runs = runs.live()
 	}
 	text, err := formatLive(state)
 	if err != nil {
@@ -98,6 +110,17 @@ func formatLive(state liveState) (string, error) {
 		lines = append(lines, "known projects:")
 		for _, project := range state.Projects {
 			lines = append(lines, "  "+oneLine(project.ID)+" · "+oneLine(project.Path))
+		}
+	}
+	sort.Slice(state.Runs, func(i, j int) bool {
+		return state.Runs[i].Order < state.Runs[j].Order ||
+			state.Runs[i].Order == state.Runs[j].Order && state.Runs[i].ID < state.Runs[j].ID
+	})
+	if len(state.Runs) != 0 {
+		lines = append(lines, "open runs:")
+		for _, run := range state.Runs {
+			lines = append(lines, "  "+oneLine(run.ID)+" · "+oneLine(string(run.Status))+" · "+
+				oneLine(run.Role)+" · "+oneLine(run.Title))
 		}
 	}
 	return strings.Join(lines, "\n"), nil

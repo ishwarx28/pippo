@@ -123,7 +123,7 @@ func TestShellDispatchesToRuntimeWithoutJoiningOrchestratorTools(t *testing.T) {
 		t.Fatal("runtime connection was not attached")
 	}
 	timeout, cwd := 12, "sub"
-	result := execTool(context.Background(), peer, "worker",
+	result := execTool(context.Background(), peer, nil, "worker",
 		callID{Turn: "run-a", Request: "request-a"}, "t_1234abcd", model.Call{
 			ID: "shell-1", Name: "shell", Args: map[string]any{
 				"command": "printf done", "timeout": timeout, "cwd": cwd,
@@ -144,12 +144,15 @@ func TestShellDispatchesToRuntimeWithoutJoiningOrchestratorTools(t *testing.T) {
 	if decodeArgs(map[string]any{"command": "pwd", "role": "worker"}, &spoofed) == nil {
 		t.Fatal("model supplied a runtime role")
 	}
-	tools, err := declarations([]model.Tool{taskTool, clarifyTool})
+	tools, err := declarations([]model.Tool{taskTool, subagentTool, clarifyTool})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(tools, `"name":"shell"`) {
+	if strings.Contains(tools, `"Name":"shell"`) {
 		t.Fatal("shell leaked into the orchestrator tool set")
+	}
+	if !strings.Contains(tools, `"Name":"subagent"`) {
+		t.Fatal("subagent was omitted from the orchestrator tool set")
 	}
 }
 
@@ -199,7 +202,7 @@ func TestShellCancellationNotifiesTheRuntime(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan model.Result, 1)
 	go func() {
-		done <- execTool(ctx, peer, "worker", callID{Turn: "run-cancel", Request: "request-cancel"}, "task-a", model.Call{
+		done <- execTool(ctx, peer, nil, "worker", callID{Turn: "run-cancel", Request: "request-cancel"}, "task-a", model.Call{
 			ID: "shell-cancel", Name: "shell", Args: map[string]any{"command": "sleep 30"},
 		})
 	}()
@@ -268,7 +271,7 @@ func TestFindDispatchesToRuntimeWithoutJoiningOrchestratorTools(t *testing.T) {
 	if peer == nil {
 		t.Fatal("runtime connection was not attached")
 	}
-	result := execTool(context.Background(), peer, "worker", callID{Turn: "run-a", Request: "request-a"}, "t_1234abcd", model.Call{
+	result := execTool(context.Background(), peer, nil, "worker", callID{Turn: "run-a", Request: "request-a"}, "t_1234abcd", model.Call{
 		ID: "find-1", Name: "find", Args: map[string]any{"query": "needle", "in": "content"},
 	})
 	request := <-requests
@@ -280,7 +283,7 @@ func TestFindDispatchesToRuntimeWithoutJoiningOrchestratorTools(t *testing.T) {
 		t.Fatalf("tool result = %#v", result)
 	}
 	content := "new\n"
-	result = execTool(context.Background(), peer, "worker", callID{Turn: "run-a", Request: "request-a"}, "t_1234abcd", model.Call{
+	result = execTool(context.Background(), peer, nil, "worker", callID{Turn: "run-a", Request: "request-a"}, "t_1234abcd", model.Call{
 		ID: "write-1", Name: "write", Args: map[string]any{"path": "new.txt", "content": content},
 	})
 	write := <-writes
@@ -293,7 +296,7 @@ func TestFindDispatchesToRuntimeWithoutJoiningOrchestratorTools(t *testing.T) {
 		t.Fatalf("write result = %#v", result)
 	}
 	replacement := "new"
-	result = execTool(context.Background(), peer, "worker", callID{Turn: "run-a", Request: "request-a"}, "t_1234abcd", model.Call{
+	result = execTool(context.Background(), peer, nil, "worker", callID{Turn: "run-a", Request: "request-a"}, "t_1234abcd", model.Call{
 		ID: "edit-1", Name: "edit", Args: map[string]any{
 			"path": "new.txt", "target": "old", "replacement": replacement,
 		},

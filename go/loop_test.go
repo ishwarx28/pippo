@@ -388,8 +388,9 @@ func (p *clarifyProvider) Stream(
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.round++
-	if key != "temporary-test-key" || len(request.Tools) != 2 ||
-		request.Tools[0].Name != "task" || request.Tools[1].Name != "clarify" {
+	if key != "temporary-test-key" || len(request.Tools) != 3 ||
+		request.Tools[0].Name != "task" || request.Tools[1].Name != "subagent" ||
+		request.Tools[2].Name != "clarify" {
 		p.err = errors.New("orchestrator tools were not declared in fixed order")
 		return p.err
 	}
@@ -424,8 +425,8 @@ func (p *taskProvider) Stream(
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.round++
-	if key != "temporary-test-key" || len(request.Tools) != 2 || request.Tools[0].Name != "task" ||
-		request.Tools[1].Name != "clarify" {
+	if key != "temporary-test-key" || len(request.Tools) != 3 || request.Tools[0].Name != "task" ||
+		request.Tools[1].Name != "subagent" || request.Tools[2].Name != "clarify" {
 		p.err = errors.New("orchestrator tools were not declared in fixed order")
 		return p.err
 	}

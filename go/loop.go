@@ -69,6 +69,7 @@ type limits struct {
 
 type loop struct {
 	provider model.Provider
+	agents   *runSet
 	mu       sync.Mutex
 	active   map[callID]context.CancelFunc
 	runs     sync.WaitGroup
@@ -76,7 +77,7 @@ type loop struct {
 }
 
 func newLoop(provider model.Provider) *loop {
-	return &loop{provider: provider, active: make(map[callID]context.CancelFunc)}
+	return &loop{provider: provider, agents: newRunSet(provider), active: make(map[callID]context.CancelFunc)}
 }
 
 func (l *loop) start(ctx context.Context, id callID) (context.Context, bool) {
@@ -120,6 +121,7 @@ func (l *loop) stop() {
 	for _, cancel := range cancels {
 		cancel()
 	}
+	l.agents.shutdown()
 	l.runs.Wait()
 }
 
@@ -142,11 +144,16 @@ func startTurn(state *state) handler {
 		if modelName == "" {
 			modelName = defaultModel
 		}
+		var settings limits
+		if err := json.Unmarshal(startup.Settings, &settings); err != nil {
+			return nil, fmt.Errorf("decode model limits: %w", err)
+		}
+		state.loop.agents.configure(int(settings.MaxParallelRuns), int(settings.MaxDepth))
 		environment, err := staticEnvironment(startup, modelName)
 		if err != nil {
 			return nil, err
 		}
-		tools := []model.Tool{taskTool, clarifyTool}
+		tools := []model.Tool{taskTool, subagentTool, clarifyTool}
 		toolText, err := declarations(tools)
 		if err != nil {
 			return nil, err
@@ -210,7 +217,7 @@ func (l *loop) stream(ctx context.Context, peer *rpc, id callID, request model.R
 
 func (l *loop) run(ctx context.Context, peer *rpc, key string, request *model.Request, id callID) error {
 	for {
-		if err := refreshLive(ctx, peer, request, ""); err != nil {
+		if err := refreshLive(ctx, peer, request, "", l.agents); err != nil {
 			return err
 		}
 		var text strings.Builder
@@ -243,7 +250,7 @@ func (l *loop) run(ctx context.Context, peer *rpc, key string, request *model.Re
 		})
 		results := make([]model.Result, 0, len(calls))
 		for _, call := range calls {
-			results = append(results, execTool(ctx, peer, "orchestrator", id, "", call))
+			results = append(results, execTool(ctx, peer, l.agents, "orchestrator", id, "", call))
 		}
 		request.History = append(request.History, model.Message{Role: "user", Results: results})
 	}

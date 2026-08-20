@@ -38,6 +38,7 @@ impl Harness {
             sheet: Mutex::new(SheetState::default()),
             key: Key,
             proj: Arc::new(Proj::open(root.clone()).unwrap()),
+            runs: Runs::open(root.clone()).unwrap(),
             rules: rule::Book::open(&root, &root).unwrap(),
             reads: write::Reads::default(),
             shells: shell::Shells::default(),

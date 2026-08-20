@@ -229,10 +229,15 @@ func (s *state) attach(peer *rpc) {
 
 func (s *state) detach(peer *rpc) {
 	s.mu.Lock()
+	detached := false
 	if s.peer == peer {
 		s.peer = nil
+		detached = true
 	}
 	s.mu.Unlock()
+	if detached && s.loop != nil {
+		s.loop.agents.interrupt(peer)
+	}
 }
 
 func (s *state) set(value hello) {

@@ -5,9 +5,37 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
+
+pub fn atomic(path: &Path, value: &impl Serialize) -> Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value).context("serialize state")?;
+    bytes.push(b'\n');
+    replace(path, &bytes)
+}
+
+pub fn replace(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().context("state file has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create state directory {}", parent.display()))?;
+    let tmp = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("file")
+    ));
+    fs::write(&tmp, bytes).with_context(|| format!("write state temp {}", tmp.display()))?;
+    File::open(&tmp)
+        .with_context(|| format!("open state temp {}", tmp.display()))?
+        .sync_all()
+        .with_context(|| format!("flush state temp {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("replace state {}", path.display()))?;
+    File::open(parent)
+        .with_context(|| format!("open state directory {}", parent.display()))?
+        .sync_all()
+        .with_context(|| format!("flush state directory {}", parent.display()))
+}
 
 #[derive(Debug)]
 pub struct Store {

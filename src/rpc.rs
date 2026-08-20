@@ -5,7 +5,7 @@ use crate::{
     key::Key,
     proj::{Proj, TaskStatus},
     rule::{self, Decision, Request as RuleRequest},
-    sess::{Call, Status},
+    sess::{Call, RunCreate, RunRole, RunStatus, Runs, Status},
     tool::{find, shell, write},
 };
 use anyhow::{Context, Result};
@@ -178,6 +178,7 @@ struct Shared {
     sheet: Mutex<SheetState>,
     key: Key,
     proj: Arc<Proj>,
+    runs: Runs,
     rules: rule::Book,
     reads: write::Reads,
     shells: shell::Shells,
@@ -254,7 +255,7 @@ impl Rpc {
         proj: Arc<Proj>,
         rules: rule::Book,
     ) -> Result<Self> {
-        let rpc = Self::open(addr, token, key, proj, rules)?;
+        let rpc = Self::open(addr, token, key, proj, rules, hello.paths.runtime.clone())?;
         let ready: Ready = rpc.call("hello", hello)?;
         if !ready.ready {
             anyhow::bail!("child process did not accept startup hello");
@@ -268,6 +269,7 @@ impl Rpc {
         key: Key,
         proj: Arc<Proj>,
         rules: rule::Book,
+        root: PathBuf,
     ) -> Result<Self> {
         let (notice_send, notice_receive) = mpsc::channel();
         let (interaction_send, interaction_receive) = mpsc::channel();
@@ -283,6 +285,7 @@ impl Rpc {
             sheet: Mutex::new(SheetState::default()),
             key,
             proj,
+            runs: Runs::open(root)?,
             rules,
             reads: write::Reads::default(),
             shells: shell::Shells::default(),
@@ -592,6 +595,7 @@ fn dispatch(
             },
             "runtime.task" => task(&shared, input.params),
             "runtime.live_env" => live(&shared, input.params),
+            "runtime.run" => run(&shared, input.params),
             "runtime.find" => find(&shared, input.params),
             "runtime.write" => write(&shared, input.params),
             "runtime.edit" => edit(&shared, input.params),
@@ -1099,6 +1103,85 @@ fn live(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fa
     })
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "lowercase")]
+#[serde(deny_unknown_fields)]
+enum RunInput {
+    Create {
+        parent_id: Option<String>,
+        task_id: Option<String>,
+        role: RunRole,
+        title: String,
+        request: String,
+        #[serde(default)]
+        constraints: Vec<String>,
+        #[serde(default)]
+        media: Vec<u16>,
+        #[serde(default)]
+        related: Vec<String>,
+        #[serde(default)]
+        highlight: Vec<PathBuf>,
+    },
+    Update {
+        id: String,
+        status: RunStatus,
+        attempt: u32,
+        report: Option<String>,
+    },
+}
+
+fn run(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
+    let input: RunInput =
+        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
+            code: -32602,
+            message: format!("decode run request: {error}"),
+        })?;
+    let result = match input {
+        RunInput::Create {
+            parent_id,
+            task_id,
+            role,
+            title,
+            request,
+            constraints,
+            media,
+            related,
+            highlight,
+        } => {
+            let (task_id, project_id) = match task_id {
+                Some(id) => {
+                    let task = shared.proj.task(&id).map_err(invalid_failure)?;
+                    (Some(task.id), Some(task.project_id))
+                }
+                None => (None, None),
+            };
+            shared.runs.create(RunCreate {
+                parent_id,
+                task_id,
+                project_id,
+                role,
+                title,
+                request,
+                constraints,
+                media,
+                related,
+                highlight,
+            })
+        }
+        RunInput::Update {
+            id,
+            status,
+            attempt,
+            report,
+        } => shared.runs.update(&id, status, attempt, report),
+    }
+    .map_err(invalid_failure)?;
+    serde_json::to_value(result).map_err(|error| Failure {
+        code: -32603,
+        message: format!("encode run result: {error}"),
+    })
+}
+
 fn find(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
     let input: find::Input =
         serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
@@ -1302,6 +1385,13 @@ fn tool_failure(error: find::Failure) -> Failure {
 fn internal_failure(error: anyhow::Error) -> Failure {
     Failure {
         code: -32603,
+        message: error.to_string(),
+    }
+}
+
+fn invalid_failure(error: anyhow::Error) -> Failure {
+    Failure {
+        code: -32602,
         message: error.to_string(),
     }
 }
