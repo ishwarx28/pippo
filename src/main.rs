@@ -2,8 +2,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod cfg;
+mod ipc;
 mod key;
 mod rpc;
+mod sess;
 mod store;
 
 use anyhow::{Context, Result};
@@ -12,7 +14,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::{IpAddr, SocketAddr},
     process::{Child, Command, Stdio},
-    sync::{mpsc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     thread,
     time::Duration,
 };
@@ -127,6 +129,7 @@ fn run() -> Result<()> {
     let root = cfg::root()?;
     let cfg = cfg::load_at(root.clone())?;
     let store = store::Store::open(root.clone())?;
+    let sess = Arc::new(sess::Sess::new(store)?);
     let spawned = Service::spawn()?;
     let key = key::Key;
     let rpc = rpc::Rpc::connect(
@@ -135,16 +138,24 @@ fn run() -> Result<()> {
         &rpc::Hello::new(&root, &cfg)?,
         key,
     )?;
+    let notices = rpc.take_notices()?;
+    let event_sess = Arc::clone(&sess);
     tauri::Builder::default()
         .manage(cfg)
         .manage(key)
-        .manage(store)
+        .manage(sess)
         .manage(rpc)
         .manage(spawned.service)
+        .setup(move |app| {
+            ipc::listen(app.handle().clone(), event_sess, notices)?;
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             key::model_key_status,
             key::store_model_key,
-            key::clear_model_key
+            key::clear_model_key,
+            ipc::send_message,
+            ipc::stop_turn
         ])
         .run(tauri::generate_context!())
         .map_err(Into::into)

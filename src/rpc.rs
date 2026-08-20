@@ -1,6 +1,10 @@
 // Owns the websocket connection and concurrent JSON-RPC dispatch.
 
-use crate::{cfg::Config, key::Key};
+use crate::{
+    cfg::Config,
+    key::Key,
+    sess::{Call, Status},
+};
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -99,8 +103,27 @@ enum Command {
 
 type Answer = std::result::Result<Value, String>;
 
+#[derive(Debug)]
+pub enum Notice {
+    Chunk {
+        call: Call,
+        text: String,
+    },
+    Closed {
+        call: Call,
+        status: Status,
+        error: Option<String>,
+    },
+}
+
+pub struct Stamped {
+    pub order: u64,
+    pub notice: std::result::Result<Notice, String>,
+}
+
 struct Shared {
     waits: Mutex<HashMap<u64, mpsc::SyncSender<Answer>>>,
+    notices: mpsc::Sender<Stamped>,
     key: Key,
 }
 
@@ -108,6 +131,7 @@ struct Inner {
     shared: Arc<Shared>,
     send: async_mpsc::UnboundedSender<Command>,
     next: AtomicU64,
+    notices: Mutex<Option<mpsc::Receiver<Stamped>>>,
     thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
@@ -127,8 +151,10 @@ impl Rpc {
     }
 
     fn open(addr: SocketAddr, token: String, key: Key) -> Result<Self> {
+        let (notice_send, notice_receive) = mpsc::channel();
         let shared = Arc::new(Shared {
             waits: Mutex::new(HashMap::new()),
+            notices: notice_send,
             key,
         });
         let (send, receive) = async_mpsc::unbounded_channel();
@@ -154,6 +180,7 @@ impl Rpc {
             shared,
             send,
             next: AtomicU64::new(0),
+            notices: Mutex::new(Some(notice_receive)),
             thread: Mutex::new(Some(handle)),
         });
         match status.recv_timeout(TIMEOUT) {
@@ -197,6 +224,15 @@ impl Rpc {
             }
         };
         serde_json::from_value(answer).with_context(|| format!("decode {method} result"))
+    }
+
+    pub fn take_notices(&self) -> Result<mpsc::Receiver<Stamped>> {
+        self.inner
+            .notices
+            .lock()
+            .map_err(|_| anyhow::anyhow!("rpc notice lock poisoned"))?
+            .take()
+            .context("rpc notices already taken")
     }
 
     fn forget(&self, id: u64) -> Result<()> {
@@ -281,12 +317,27 @@ async fn connection(
     });
     let read_shared = Arc::clone(&shared);
     let read = tokio::spawn(async move {
+        let mut notice_order = 0;
         while let Some(message) = reader.next().await {
             match message.map_err(|error| format!("read rpc message: {error}"))? {
                 Message::Text(text) => {
+                    let input: Wire = match serde_json::from_slice(text.as_bytes()) {
+                        Ok(input) => input,
+                        Err(error) => {
+                            eprintln!("invalid rpc message: {error}");
+                            continue;
+                        }
+                    };
+                    let order = match (input.jsonrpc.as_str(), input.method.as_deref()) {
+                        ("2.0", Some("turn.chunk" | "turn.closed")) => {
+                            notice_order += 1;
+                            Some(notice_order)
+                        }
+                        _ => None,
+                    };
                     let shared = Arc::clone(&read_shared);
                     let output = output.clone();
-                    tokio::spawn(async move { dispatch(shared, output, text.as_bytes()) });
+                    tokio::spawn(async move { dispatch(shared, output, input, order) });
                 }
                 Message::Close(_) => return Ok(()),
                 _ => {}
@@ -304,14 +355,12 @@ async fn connection(
     result
 }
 
-fn dispatch(shared: Arc<Shared>, output: async_mpsc::UnboundedSender<Command>, bytes: &[u8]) {
-    let input: Wire = match serde_json::from_slice(bytes) {
-        Ok(input) => input,
-        Err(error) => {
-            eprintln!("invalid rpc message: {error}");
-            return;
-        }
-    };
+fn dispatch(
+    shared: Arc<Shared>,
+    output: async_mpsc::UnboundedSender<Command>,
+    input: Wire,
+    order: Option<u64>,
+) {
     if input.jsonrpc != "2.0" {
         if let Some(id) = input.id {
             respond(
@@ -341,6 +390,19 @@ fn dispatch(shared: Arc<Shared>, output: async_mpsc::UnboundedSender<Command>, b
                     message: error.to_string(),
                 }),
             },
+            "turn.chunk" => {
+                send_notice(&shared, order, input.params, |value: Chunk| Notice::Chunk {
+                    call: value.call,
+                    text: value.text,
+                })
+            }
+            "turn.closed" => send_notice(&shared, order, input.params, |value: Closed| {
+                Notice::Closed {
+                    call: value.call,
+                    status: value.status,
+                    error: value.error,
+                }
+            }),
             _ => Err(Failure {
                 code: -32601,
                 message: "method not found".into(),
@@ -371,6 +433,50 @@ fn dispatch(shared: Arc<Shared>, output: async_mpsc::UnboundedSender<Command>, b
             }
         }
         Err(_) => eprintln!("rpc pending lock poisoned"),
+    }
+}
+
+#[derive(Deserialize)]
+struct Chunk {
+    #[serde(flatten)]
+    call: Call,
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct Closed {
+    #[serde(flatten)]
+    call: Call,
+    status: Status,
+    error: Option<String>,
+}
+
+fn send_notice<T: for<'de> Deserialize<'de>>(
+    shared: &Shared,
+    order: Option<u64>,
+    params: Option<Value>,
+    map: impl FnOnce(T) -> Notice,
+) -> std::result::Result<Value, Failure> {
+    let order = order.ok_or_else(|| Failure {
+        code: -32600,
+        message: "turn notification is unordered".into(),
+    })?;
+    let notice = serde_json::from_value(params.unwrap_or(Value::Null))
+        .map(map)
+        .map_err(|error| format!("decode turn notification: {error}"));
+    let failed = notice.as_ref().err().cloned();
+    if shared.notices.send(Stamped { order, notice }).is_err() {
+        return Err(Failure {
+            code: -32603,
+            message: "turn notification receiver is closed".into(),
+        });
+    }
+    match failed {
+        Some(message) => Err(Failure {
+            code: -32602,
+            message,
+        }),
+        None => Ok(Value::Null),
     }
 }
 

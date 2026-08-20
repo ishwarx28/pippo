@@ -42,6 +42,16 @@ impl Store {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn append<T: Serialize>(&self, message: &T) -> Result<()> {
         let _guard = self.lock()?;
+        self.append_locked(message)
+    }
+
+    pub fn record<T: Serialize, R: Serialize>(&self, message: &T, replay: &R) -> Result<()> {
+        let _guard = self.lock()?;
+        self.append_locked(message)?;
+        self.replace_replay_locked(replay)
+    }
+
+    fn append_locked<T: Serialize>(&self, message: &T) -> Result<()> {
         let path = self.history_path();
         let mut bytes = serde_json::to_vec(message).context("serialize history message")?;
         bytes.push(b'\n');
@@ -72,6 +82,10 @@ impl Store {
 
     pub fn replace_replay<T: Serialize>(&self, replay: &T) -> Result<()> {
         let _guard = self.lock()?;
+        self.replace_replay_locked(replay)
+    }
+
+    fn replace_replay_locked<T: Serialize>(&self, replay: &T) -> Result<()> {
         let path = self.replay_path();
         let tmp = self.session.join(".replay.json.tmp");
         let mut bytes = serde_json::to_vec_pretty(replay).context("serialize replay")?;
