@@ -54,6 +54,33 @@ var clarifyTool = model.Tool{
 	},
 }
 
+var findTool = model.Tool{
+	Name:        "find",
+	Description: "Search paths or text, or read a bounded line range. Relative paths use the run's project.",
+	Parameters: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"query":   map[string]any{"type": "string"},
+			"regex":   map[string]any{"type": "boolean"},
+			"in":      map[string]any{"type": "string", "enum": []string{"content", "path", "both"}},
+			"root":    map[string]any{"type": "string"},
+			"context": map[string]any{"type": "integer", "minimum": 0, "maximum": 20},
+			"cap":     map[string]any{"type": "integer", "minimum": 1, "maximum": 200},
+			"offset":  map[string]any{"type": "integer", "minimum": 0},
+			"path":    map[string]any{"type": "string"},
+			"range": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"start": map[string]any{"type": "integer", "minimum": 1},
+					"end":   map[string]any{"type": "integer", "minimum": 1},
+				},
+				"required": []string{"start", "end"}, "additionalProperties": false,
+			},
+		},
+		"additionalProperties": false,
+	},
+}
+
 type taskArgs struct {
 	Action string `json:"action"`
 	Title  string `json:"title,omitempty"`
@@ -79,6 +106,28 @@ type clarifyRequest struct {
 	clarifyArgs
 }
 
+type findRange struct {
+	Start int `json:"start"`
+	End   int `json:"end"`
+}
+
+type findArgs struct {
+	Query   string     `json:"query,omitempty"`
+	Regex   bool       `json:"regex,omitempty"`
+	In      string     `json:"in,omitempty"`
+	Root    string     `json:"root,omitempty"`
+	Context *int       `json:"context,omitempty"`
+	Cap     *int       `json:"cap,omitempty"`
+	Offset  *int       `json:"offset,omitempty"`
+	Path    string     `json:"path,omitempty"`
+	Range   *findRange `json:"range,omitempty"`
+}
+
+type findRequest struct {
+	TaskID string `json:"task_id,omitempty"`
+	findArgs
+}
+
 func declarations(tools []model.Tool) (string, error) {
 	lines := make([]string, 0, len(tools))
 	for _, tool := range tools {
@@ -91,7 +140,7 @@ func declarations(tools []model.Tool) (string, error) {
 	return strings.Join(lines, "\n"), nil
 }
 
-func execTool(ctx context.Context, peer *rpc, id callID, call model.Call) model.Result {
+func execTool(ctx context.Context, peer *rpc, id callID, taskID string, call model.Call) model.Result {
 	result := model.Result{ID: call.ID, Name: call.Name}
 	switch call.Name {
 	case taskTool.Name:
@@ -132,10 +181,55 @@ func execTool(ctx context.Context, peer *rpc, id callID, call model.Call) model.
 		} else {
 			result.Data = map[string]any{"answer": output.Answer}
 		}
+	case findTool.Name:
+		var args findArgs
+		if err := decodeArgs(call.Args, &args); err != nil {
+			result.Data = map[string]any{"error": "invalid find arguments"}
+			return result
+		}
+		if err := checkFind(args); err != nil {
+			result.Data = map[string]any{"error": err.Error()}
+			return result
+		}
+		var output map[string]any
+		if err := peer.call(ctx, "runtime.find", findRequest{TaskID: taskID, findArgs: args}, &output); err != nil {
+			result.Data = map[string]any{"error": err.Error()}
+		} else {
+			result.Data = output
+		}
 	default:
 		result.Data = map[string]any{"error": "unknown tool"}
 	}
 	return result
+}
+
+func checkFind(args findArgs) error {
+	search := args.Query != ""
+	read := args.Path != ""
+	if search == read {
+		return errors.New("find requires either query or path")
+	}
+	if search {
+		if args.Range != nil {
+			return errors.New("search does not accept a range")
+		}
+		if args.In != "" && args.In != "content" && args.In != "path" && args.In != "both" {
+			return fmt.Errorf("invalid find target %q", args.In)
+		}
+		if args.Context != nil && (*args.Context < 0 || *args.Context > 20) ||
+			args.Cap != nil && (*args.Cap < 1 || *args.Cap > 200) ||
+			args.Offset != nil && *args.Offset < 0 {
+			return errors.New("find paging value is outside its limit")
+		}
+		return nil
+	}
+	if args.Regex || args.In != "" || args.Root != "" || args.Context != nil || args.Cap != nil || args.Offset != nil {
+		return errors.New("read accepts only path and range")
+	}
+	if args.Range != nil && (args.Range.Start < 1 || args.Range.End < args.Range.Start) {
+		return errors.New("invalid read range")
+	}
+	return nil
 }
 
 func decodeArgs(input map[string]any, output any) error {

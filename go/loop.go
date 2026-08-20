@@ -243,7 +243,7 @@ func (l *loop) run(ctx context.Context, peer *rpc, key string, request *model.Re
 		})
 		results := make([]model.Result, 0, len(calls))
 		for _, call := range calls {
-			results = append(results, execTool(ctx, peer, id, call))
+			results = append(results, execTool(ctx, peer, id, "", call))
 		}
 		request.History = append(request.History, model.Message{Role: "user", Results: results})
 	}

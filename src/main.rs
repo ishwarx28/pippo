@@ -8,6 +8,9 @@ mod proj;
 mod rpc;
 mod sess;
 mod store;
+mod tool {
+    pub mod find;
+}
 
 use anyhow::{Context, Result};
 use std::{

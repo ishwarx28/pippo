@@ -5,6 +5,7 @@ use crate::{
     key::Key,
     proj::{Proj, TaskStatus},
     sess::{Call, Status},
+    tool::find,
 };
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -517,6 +518,7 @@ fn dispatch(
             },
             "runtime.task" => task(&shared, input.params),
             "runtime.live_env" => live(&shared, input.params),
+            "runtime.find" => find(&shared, input.params),
             "runtime.clarify.cancel" => cancel_clarify(&shared, input.params),
             "turn.chunk" => {
                 send_notice(&shared, order, input.params, |value: Chunk| Notice::Chunk {
@@ -879,6 +881,25 @@ fn live(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fa
     })
 }
 
+fn find(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
+    let input: find::Input =
+        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
+            code: -32602,
+            message: format!("decode find request: {error}"),
+        })?;
+    let scope = shared
+        .proj
+        .scope(input.task_id.as_deref())
+        .map_err(|error| Failure {
+            code: -32602,
+            message: error.to_string(),
+        })?;
+    serde_json::to_value(find::run(&scope, input)).map_err(|error| Failure {
+        code: -32603,
+        message: format!("encode find result: {error}"),
+    })
+}
+
 fn send_notice<T: for<'de> Deserialize<'de>>(
     shared: &Shared,
     order: Option<u64>,
@@ -1068,6 +1089,36 @@ mod tests {
         .is_ok());
         drop(shared);
         assert!(Proj::open(root.clone()).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn find_requests_use_the_active_task_scope() {
+        let root = std::env::temp_dir().join(format!("pippo-rpc-proj-{}-find", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let work = root.join("work");
+        std::fs::create_dir_all(work.join("src")).unwrap();
+        std::fs::write(work.join("src/main.rs"), b"first\nneedle\nlast\n").unwrap();
+        let (shared, _interactions) = shared(&root);
+        task(
+            &shared,
+            Some(serde_json::json!({
+                "action": "create", "title": "search project text", "path": work
+            })),
+        )
+        .unwrap();
+        let result = find(
+            &shared,
+            Some(serde_json::json!({
+                "query": "needle", "in": "content", "context": 1
+            })),
+        )
+        .unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["kind"], "search");
+        assert_eq!(result["hits"][0]["path"], "src/main.rs");
+        assert_eq!(result["hits"][0]["line"], 2);
+        assert_eq!(result["hits"][0]["context"].as_array().unwrap().len(), 3);
         std::fs::remove_dir_all(root).unwrap();
     }
 
