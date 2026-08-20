@@ -4,10 +4,10 @@
   "version": "0.1.0",
   "identifier": "app.pippo.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev --prefix ui",
-    "beforeBuildCommand": "npm run build --prefix ui",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
     "devUrl": "http://localhost:1420",
-    "frontendDist": "../ui/dist"
+    "frontendDist": "ui/dist"
   },
   "app": {
     "windows": [
