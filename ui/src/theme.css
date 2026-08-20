@@ -1,0 +1,110 @@
+/* Owns visual tokens and global theming. */
+:root,
+[data-theme="light"] {
+  --bg: #fbfaf8;
+  --surface: #f4f2ee;
+  --surface-2: #edeae4;
+  --line: #e3ded6;
+  --text: #1b1916;
+  --dim: #6c665c;
+  --accent: #2f5fa8;
+  --accent-bg: #e7eef8;
+  --run: #2f5fa8;
+  --wait: #a8761f;
+  --bad: #a33a2c;
+  --good: #3e7a4c;
+  --scrim: rgba(20, 19, 16, 0.32);
+  --sans: Inter, -apple-system, "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --t-xs: 11px / 1.4;
+  --t-sm: 12px / 1.5;
+  --t-md: 13px / 1.6;
+  --t-lg: 15px / 1.4;
+  --t-code: 12.5px / 1.6;
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+  --r: 0;
+  --r-sm: 3px;
+  --hit: 28px;
+  --line-w: 1px;
+  --fast: 120ms;
+  --slow: 160ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+  --wordmark-track: -0.01em;
+  --focus-w: 2px;
+  --focus-offset: 2px;
+  --motion-off: 0ms;
+  color-scheme: light;
+}
+
+[data-theme="dark"] {
+  --bg: #141310;
+  --surface: #1c1a17;
+  --surface-2: #232019;
+  --line: #2c2822;
+  --text: #ede9e2;
+  --dim: #9a9289;
+  --accent: #7fa8e8;
+  --accent-bg: #1a2436;
+  --run: #7fa8e8;
+  --wait: #d9a340;
+  --bad: #e08074;
+  --good: #79b489;
+  --scrim: rgba(0, 0, 0, 0.5);
+  color-scheme: dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --bg: #141310;
+    --surface: #1c1a17;
+    --surface-2: #232019;
+    --line: #2c2822;
+    --text: #ede9e2;
+    --dim: #9a9289;
+    --accent: #7fa8e8;
+    --accent-bg: #1a2436;
+    --run: #7fa8e8;
+    --wait: #d9a340;
+    --bad: #e08074;
+    --good: #79b489;
+    --scrim: rgba(0, 0, 0, 0.5);
+    color-scheme: dark;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  height: 100%;
+}
+
+body {
+  margin: var(--r);
+  background: var(--bg);
+  color: var(--text);
+  font: 400 var(--t-md) var(--sans);
+}
+
+:focus-visible {
+  outline: var(--focus-w) solid var(--accent);
+  outline-offset: var(--focus-offset);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: var(--motion-off) !important;
+    transition-duration: var(--motion-off) !important;
+  }
+}

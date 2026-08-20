@@ -1,0 +1,16 @@
+[package]
+name = "pippo"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = "2"
+
+[dependencies]
+tauri = "2"
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true

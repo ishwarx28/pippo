@@ -1,0 +1,14 @@
+/* Owns the minimal app shell layout. */
+.shell {
+  min-height: 100%;
+  display: grid;
+  place-items: center;
+  background: var(--bg);
+}
+
+.wordmark {
+  margin: var(--r);
+  font: 600 var(--t-lg) var(--sans);
+  letter-spacing: var(--wordmark-track);
+  user-select: none;
+}

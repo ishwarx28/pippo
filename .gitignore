@@ -4,6 +4,7 @@
 
 # build output
 /target/
+/gen/
 /src-tauri/target/
 /ui/dist/
 /ui/build/
