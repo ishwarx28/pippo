@@ -6,7 +6,7 @@ use std::{
     collections::BTreeMap,
     fmt::Write as _,
     fs::{self, File},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{Mutex, MutexGuard},
 };
 
@@ -42,6 +42,38 @@ pub struct TaskReply {
     pub project_id: String,
     pub project_registered: bool,
     pub status: TaskStatus,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Scope {
+    root: PathBuf,
+}
+
+impl Scope {
+    fn new(root: PathBuf) -> Result<Self> {
+        if !root.is_absolute() {
+            anyhow::bail!("project path must be absolute");
+        }
+        let root = if root.exists() {
+            fs::canonicalize(&root)
+                .with_context(|| format!("resolve project path {}", root.display()))?
+        } else {
+            lexical(&root)
+        };
+        Ok(Self { root })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn resolve(&self, path: Option<&Path>) -> PathBuf {
+        match path {
+            None => self.root().to_path_buf(),
+            Some(path) if path.is_absolute() => lexical(path),
+            Some(path) => lexical(&self.root.join(path)),
+        }
+    }
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -89,10 +121,7 @@ impl Proj {
         if !(2..=8).contains(&title.split_whitespace().count()) {
             anyhow::bail!("task title must contain 2 to 8 words");
         }
-        if !path.is_absolute() {
-            anyhow::bail!("project path must be absolute");
-        }
-        let path = clean(path)?;
+        let path = Scope::new(path)?.resolve(None);
         let mut state = self.lock()?;
         if let Some(active) = state.meta.active_task.as_deref() {
             anyhow::bail!("task {active} is still active");
@@ -135,6 +164,10 @@ impl Proj {
         .with_context(|| format!("create report directory for task {id}"))?;
         self.save(&next)?;
         state.meta = next;
+        drop(state);
+        if self.scope(Some(&id))?.resolve(None) != path {
+            anyhow::bail!("task {id} has an inconsistent project scope");
+        }
         Ok(TaskReply {
             task_id: id,
             project_id: project.id,
@@ -176,6 +209,30 @@ impl Proj {
             project_id,
             project_registered: false,
             status,
+        })
+    }
+
+    pub fn scope(&self, task_id: Option<&str>) -> Result<Scope> {
+        let state = self.lock()?;
+        let id = match task_id {
+            Some(id) => id,
+            None => state
+                .meta
+                .active_task
+                .as_deref()
+                .context("no active task")?,
+        };
+        let task = state
+            .meta
+            .tasks
+            .get(id)
+            .with_context(|| format!("task {id} is not registered"))?;
+        let project = state
+            .projects
+            .get(&task.project_id)
+            .with_context(|| format!("project {} is not registered", task.project_id))?;
+        Ok(Scope {
+            root: project.path.clone(),
         })
     }
 
@@ -324,12 +381,20 @@ fn valid_task_id(id: &str) -> bool {
     id.len() == 10 && id.starts_with("t_") && id[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn clean(path: PathBuf) -> Result<PathBuf> {
-    if path.exists() {
-        fs::canonicalize(&path).with_context(|| format!("resolve project path {}", path.display()))
-    } else {
-        Ok(path)
+fn lexical(path: &Path) -> PathBuf {
+    let mut clean = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                clean.pop();
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                clean.push(part.as_os_str());
+            }
+        }
     }
+    clean
 }
 
 #[cfg(test)]
@@ -437,6 +502,82 @@ mod tests {
         fs::write(&meta, serde_json::to_vec(&value).unwrap()).unwrap();
         assert!(Proj::open(root.clone()).is_err());
         assert!(created.task_id.starts_with("t_"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scope_resolves_every_tool_path_from_one_base() {
+        let root = root();
+        let real = root.join("work/real");
+        let link = root.join("work/link");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let proj = Proj::open(root.clone()).unwrap();
+        proj.create("scope path behavior".into(), link).unwrap();
+
+        let scope = proj.scope(None).unwrap();
+        let canonical = fs::canonicalize(&real).unwrap();
+        assert_eq!(scope.root(), canonical);
+        assert_eq!(scope.resolve(None), canonical);
+        assert_eq!(
+            scope.resolve(Some(Path::new("src/./main.rs"))),
+            canonical.join("src/main.rs")
+        );
+        assert_eq!(
+            scope.resolve(Some(Path::new("../shared/file.txt"))),
+            canonical.parent().unwrap().join("shared/file.txt")
+        );
+        let outside = root.join("outside/../other/file.txt");
+        assert_eq!(scope.resolve(Some(&outside)), root.join("other/file.txt"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scope_tracks_sequential_projects_without_losing_closed_tasks() {
+        let root = root();
+        let first_path = root.join("first");
+        let second_path = root.join("second");
+        fs::create_dir_all(&first_path).unwrap();
+        fs::create_dir_all(&second_path).unwrap();
+        let proj = Proj::open(root.clone()).unwrap();
+        assert!(proj
+            .scope(None)
+            .unwrap_err()
+            .to_string()
+            .contains("no active task"));
+        assert!(proj
+            .scope(Some("t_00000000"))
+            .unwrap_err()
+            .to_string()
+            .contains("not registered"));
+
+        let first = proj
+            .create("work in first".into(), first_path.clone())
+            .unwrap();
+        let first_scope = proj.scope(None).unwrap();
+        assert_eq!(first_scope.root(), fs::canonicalize(&first_path).unwrap());
+        proj.update(first.task_id.clone(), TaskStatus::Done, "verified".into())
+            .unwrap();
+        assert!(proj.scope(None).is_err());
+        assert_eq!(proj.scope(Some(&first.task_id)).unwrap(), first_scope);
+
+        let second = proj
+            .create("work in second".into(), second_path.clone())
+            .unwrap();
+        assert_eq!(
+            proj.scope(None).unwrap().root(),
+            fs::canonicalize(&second_path).unwrap()
+        );
+        assert_eq!(proj.scope(Some(&first.task_id)).unwrap(), first_scope);
+        assert_ne!(first.project_id, second.project_id);
+        drop(proj);
+
+        let reopened = Proj::open(root.clone()).unwrap();
+        assert_eq!(
+            reopened.scope(None).unwrap().root(),
+            fs::canonicalize(&second_path).unwrap()
+        );
+        assert_eq!(reopened.scope(Some(&first.task_id)).unwrap(), first_scope);
         fs::remove_dir_all(root).unwrap();
     }
 }
