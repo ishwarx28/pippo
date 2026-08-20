@@ -3,9 +3,9 @@
 use crate::{
     cfg::{self, Config},
     key::Key,
-    proj::{Plan, Proj, Step, StepStatus, TaskStatus},
+    proj::{Plan, Proj, Scope, Step, StepStatus, TaskStatus},
     rule::{self, Decision, Request as RuleRequest},
-    sess::{Call, RunCreate, RunMeta, RunReport, RunRole, RunStatus, Runs, Status},
+    sess::{Call, RunCreate, RunMeta, RunReport, RunRole, RunStatus, Runs, Sess, Status},
     tool::{find, shell, write},
 };
 use anyhow::{Context, Result};
@@ -55,6 +55,16 @@ pub struct Hello {
     pub platform: Platform,
     pub settings: Config,
     pub preset: cfg::Preset,
+}
+
+impl ApprovalKey {
+    fn new(turn: &str, request: &str, call: &str) -> Self {
+        Self {
+            turn: turn.into(),
+            request: request.into(),
+            call: call.into(),
+        }
+    }
 }
 
 impl Hello {
@@ -183,6 +193,7 @@ struct Shared {
     sheet: Mutex<SheetState>,
     key: Key,
     proj: Arc<Proj>,
+    sess: Arc<Sess>,
     runs: Runs,
     rules: rule::Book,
     reads: write::Reads,
@@ -258,9 +269,10 @@ impl Rpc {
         hello: &Hello,
         key: Key,
         proj: Arc<Proj>,
+        sess: Arc<Sess>,
         rules: rule::Book,
     ) -> Result<Self> {
-        let rpc = Self::open(addr, token, key, proj, rules, hello.paths.runtime.clone())?;
+        let rpc = Self::open(addr, token, key, proj, sess, rules, hello.paths.runtime.clone())?;
         let ready: Ready = rpc.call("hello", hello)?;
         if !ready.ready {
             anyhow::bail!("child process did not accept startup hello");
@@ -273,6 +285,7 @@ impl Rpc {
         token: String,
         key: Key,
         proj: Arc<Proj>,
+        sess: Arc<Sess>,
         rules: rule::Book,
         root: PathBuf,
     ) -> Result<Self> {
@@ -290,6 +303,7 @@ impl Rpc {
             sheet: Mutex::new(SheetState::default()),
             key,
             proj,
+            sess,
             runs: Runs::open(root)?,
             rules,
             reads: write::Reads::default(),
@@ -599,6 +613,7 @@ fn dispatch(
             "runtime.live_env" => live(&shared, input.params),
             "runtime.run" => run(&shared, input.params),
             "runtime.plan" => plan(&shared, input.params),
+            "runtime.steer" => steer(&shared, input.params),
             "runtime.find" => find(&shared, input.params),
             "runtime.write" => write(&shared, input.params),
             "runtime.edit" => edit(&shared, input.params),
@@ -1199,12 +1214,15 @@ fn plan(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fa
     encode(serde_json::json!({"ok": true, "path": path}), "plan result")
 }
 
+fn steer(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
+    let call: Call = decode(params, "steering request")?;
+    let messages = shared.sess.drain(&call).map_err(internal_failure)?;
+    encode(serde_json::json!({"messages": messages}), "steering")
+}
+
 fn find(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
     let input: find::Input = decode(params, "find request")?;
-    let scope = shared
-        .proj
-        .scope(input.task_id.as_deref())
-        .map_err(invalid_failure)?;
+    let scope = scoped(shared, input.task_id.as_deref())?;
     let key = match (input.turn_id.clone(), input.request_id.clone()) {
         (Some(turn), Some(request)) => Some(write::Key::new(turn, request).map_err(tool_failure)?),
         (None, None) => None,
@@ -1246,10 +1264,7 @@ fn find(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fa
 
 fn write(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
     let input: write::WriteInput = decode(params, "write request")?;
-    let scope = shared
-        .proj
-        .scope(input.task_id.as_deref())
-        .map_err(internal_failure)?;
+    let scope = scoped(shared, input.task_id.as_deref())?;
     write::Key::new(input.turn_id.clone(), input.request_id.clone()).map_err(tool_failure)?;
     let path = write::policy_path(&scope, &input.path, false).map_err(tool_failure)?;
     let detail = format!("{:016x}", write::sig(input.content.as_bytes()));
@@ -1263,11 +1278,7 @@ fn write(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, F
             project: scope.root(),
             detail: &detail,
         },
-        ApprovalKey {
-            turn: input.turn_id.clone(),
-            request: input.request_id.clone(),
-            call: input.call_id.clone(),
-        },
+        ApprovalKey::new(&input.turn_id, &input.request_id, &input.call_id),
     ) {
         return Ok(gated("write", error));
     }
@@ -1279,10 +1290,7 @@ fn write(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, F
 
 fn edit(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
     let input: write::EditInput = decode(params, "edit request")?;
-    let scope = shared
-        .proj
-        .scope(input.task_id.as_deref())
-        .map_err(internal_failure)?;
+    let scope = scoped(shared, input.task_id.as_deref())?;
     let key =
         write::Key::new(input.turn_id.clone(), input.request_id.clone()).map_err(tool_failure)?;
     let path = write::policy_path(&scope, &input.path, true).map_err(tool_failure)?;
@@ -1302,11 +1310,7 @@ fn edit(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fa
             project: scope.root(),
             detail: &detail,
         },
-        ApprovalKey {
-            turn: input.turn_id.clone(),
-            request: input.request_id.clone(),
-            call: input.call_id.clone(),
-        },
+        ApprovalKey::new(&input.turn_id, &input.request_id, &input.call_id),
     ) {
         return Ok(gated("edit", error));
     }
@@ -1325,10 +1329,7 @@ fn edit(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fa
 
 fn shell(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
     let mut input: shell::Input = decode(params, "shell request")?;
-    let scope = shared
-        .proj
-        .scope(input.task_id.as_deref())
-        .map_err(internal_failure)?;
+    let scope = scoped(shared, input.task_id.as_deref())?;
     let cwd = shell::policy_cwd(&scope, &input).map_err(tool_failure)?;
     let detail = if input.env.is_empty() {
         String::new()
@@ -1345,16 +1346,16 @@ fn shell(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, F
             project: scope.root(),
             detail: &detail,
         },
-        ApprovalKey {
-            turn: input.turn_id.clone(),
-            request: input.request_id.clone(),
-            call: input.call_id.clone(),
-        },
+        ApprovalKey::new(&input.turn_id, &input.request_id, &input.call_id),
     ) {
         return Ok(gated("shell", error));
     }
     input.cwd = Some(cwd);
     encode(shared.shells.run(&scope, input), "shell result")
+}
+
+fn scoped(shared: &Shared, task: Option<&str>) -> std::result::Result<Scope, Failure> {
+    shared.proj.scope(task).map_err(invalid_failure)
 }
 
 fn gated(kind: &str, error: GateFailure) -> Value {
@@ -1462,6 +1463,13 @@ fn fail_all(shared: &Shared, error: String) {
     close_shared(shared, &error);
 }
 
+fn taken<T>(slot: &Mutex<Option<T>>) -> Option<T> {
+    match slot.lock() {
+        Ok(mut value) => value.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    }
+}
+
 fn close_shared(shared: &Shared, error: &str) {
     shared.shells.cancel_all();
     let waits = {
@@ -1476,10 +1484,7 @@ fn close_shared(shared: &Shared, error: &str) {
             .map(|(_, wait)| wait)
             .collect::<Vec<_>>()
     };
-    match shared.notices.lock() {
-        Ok(mut notices) => notices.take(),
-        Err(poisoned) => poisoned.into_inner().take(),
-    };
+    taken(&shared.notices);
     let clarify = match shared.clarify.lock() {
         Ok(mut state) => state.active.take(),
         Err(poisoned) => poisoned.into_inner().active.take(),
@@ -1512,10 +1517,7 @@ fn close_shared(shared: &Shared, error: &str) {
             },
         );
     }
-    match shared.interactions.lock() {
-        Ok(mut interactions) => interactions.take(),
-        Err(poisoned) => poisoned.into_inner().take(),
-    };
+    taken(&shared.interactions);
     for wait in waits {
         if wait.send(Err(error.into())).is_err() {
             eprintln!("rpc caller stopped waiting");

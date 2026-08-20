@@ -237,6 +237,9 @@ func (l *loop) run(ctx context.Context, peer *rpc, key string, request *model.Re
 		if notice != "" {
 			request.History = append(request.History, model.Message{Role: "user", Text: notice})
 		}
+		if err := drainSteer(ctx, peer, request, id); err != nil {
+			return err
+		}
 		if err := refreshLive(ctx, peer, request, "", l.agents); err != nil {
 			return err
 		}
@@ -286,6 +289,22 @@ func (l *loop) run(ctx context.Context, peer *rpc, key string, request *model.Re
 			request.History = append(request.History, model.Message{Role: "user", Text: notice})
 		}
 	}
+}
+
+// The next decision point: steering reaches the orchestrator, never a run already under way.
+func drainSteer(ctx context.Context, peer *rpc, request *model.Request, id callID) error {
+	var output struct {
+		Messages []string `json:"messages"`
+	}
+	if err := peer.call(ctx, "runtime.steer", id, &output); err != nil {
+		return fmt.Errorf("collect steering: %w", err)
+	}
+	for _, text := range output.Messages {
+		request.History = append(request.History, model.Message{
+			Role: "user", Text: "The user adds, mid-turn:\n" + text,
+		})
+	}
+	return nil
 }
 
 func assemble(modelName string, input prompt) model.Request {

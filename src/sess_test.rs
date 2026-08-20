@@ -18,11 +18,18 @@ fn session(root: &Path) -> Sess {
     Sess::new(Store::open(root.to_path_buf()).unwrap()).unwrap()
 }
 
+fn opened(session: &Sess, query: String) -> Start {
+    match session.send(query).unwrap() {
+        Outcome::Started(start) => start,
+        Outcome::Queued(..) => panic!("expected a new turn"),
+    }
+}
+
 #[test]
 fn records_open_chunks_and_close_in_order() {
     let root = root();
     let session = session(&root);
-    let start = session.open("hello".into()).unwrap();
+    let start = opened(&session, "hello".into());
     let first = session.chunk(&start.call, "one ".into()).unwrap().unwrap();
     let second = session.chunk(&start.call, "two".into()).unwrap().unwrap();
     let closed = session
@@ -47,7 +54,7 @@ fn records_open_chunks_and_close_in_order() {
 fn cancellation_stays_correlated_until_terminal_close() {
     let root = root();
     let session = session(&root);
-    let start = session.open("wait".into()).unwrap();
+    let start = opened(&session, "wait".into());
     assert_eq!(session.request_cancel().unwrap(), Some(start.call.clone()));
     assert!(session.started(&start.call).unwrap());
     let event = session
@@ -70,7 +77,7 @@ fn cancellation_stays_correlated_until_terminal_close() {
 fn shutdown_durably_cancels_once_and_rejects_late_close() {
     let root = root();
     let current = session(&root);
-    let start = current.open("wait".into()).unwrap();
+    let start = opened(&current, "wait".into());
     current.chunk(&start.call, "partial".into()).unwrap();
     let closed = current.shutdown().unwrap().unwrap();
     assert!(matches!(
@@ -105,7 +112,7 @@ fn shutdown_durably_cancels_once_and_rejects_late_close() {
 fn replay_never_invents_a_terminal_state() {
     let root = root();
     let session = session(&root);
-    let start = session.open("unfinished".into()).unwrap();
+    let start = opened(&session, "unfinished".into());
     session.chunk(&start.call, "partial".into()).unwrap();
     drop(session);
     let store = Store::open(root.clone()).unwrap();
@@ -120,14 +127,14 @@ fn replay_never_invents_a_terminal_state() {
 fn ignores_duplicate_and_late_notifications() {
     let root = root();
     let session = session(&root);
-    let first = session.open("first".into()).unwrap();
+    let first = opened(&session, "first".into());
     session.chunk(&first.call, "kept".into()).unwrap();
     session.close(&first.call, Status::Done, None).unwrap();
     assert_eq!(
         session.close(&first.call, Status::Done, None).unwrap(),
         None
     );
-    let second = session.open("second".into()).unwrap();
+    let second = opened(&session, "second".into());
     assert_eq!(session.chunk(&first.call, "late".into()).unwrap(), None);
     assert_eq!(
         session
@@ -200,7 +207,7 @@ fn restores_message_projection_from_replay() {
 fn a_turn_killed_mid_reply_is_closed_when_the_session_reopens() {
     let root = root();
     let killed = session(&root);
-    let start = killed.open("hello".into()).unwrap();
+    let start = opened(&killed, "hello".into());
     killed.chunk(&start.call, "partial".into()).unwrap();
     drop(killed);
 
@@ -215,7 +222,7 @@ fn a_turn_killed_mid_reply_is_closed_when_the_session_reopens() {
             .unwrap(),
         messages
     );
-    let next = restored.open("again".into()).unwrap();
+    let next = opened(&restored, "again".into());
     assert_eq!(
         restored
             .close(&next.call, Status::Done, None)

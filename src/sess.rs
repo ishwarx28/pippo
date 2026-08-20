@@ -1,6 +1,6 @@
 // Owns turn state, durable message transitions and live context.
 
-use crate::store::{atomic, replace, Store};
+use crate::store::{self, atomic, replace, Store};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -120,7 +120,7 @@ impl Runs {
             }
         }
         let id = loop {
-            let id = run_id()?;
+            let id = store::id("r", 4)?;
             if !entries.contains_key(&id) {
                 break id;
             }
@@ -404,16 +404,6 @@ fn load_runs(
     Ok(())
 }
 
-fn run_id() -> Result<String> {
-    let mut bytes = [0_u8; 4];
-    getrandom::fill(&mut bytes).map_err(|error| anyhow::anyhow!("generate run id: {error}"))?;
-    let mut id = String::from("r_");
-    for byte in bytes {
-        write!(id, "{byte:02x}").context("encode run id")?;
-    }
-    Ok(id)
-}
-
 fn valid_run_id(id: &str) -> bool {
     id.len() == 10 && id.starts_with("r_") && id[2..].bytes().all(|byte| byte.is_ascii_hexdigit())
 }
@@ -475,6 +465,17 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    Steered {
+        #[serde(flatten)]
+        call: Call,
+        user: Message,
+    },
+}
+
+/// A message typed while a turn runs is queued for it, never started as a second turn.
+pub enum Outcome {
+    Started(Start),
+    Queued(Call, Event),
 }
 
 pub struct Start {
@@ -495,6 +496,7 @@ struct Active {
 struct State {
     messages: Vec<Message>,
     active: Option<Active>,
+    queued: Vec<String>,
 }
 
 pub struct Sess {
@@ -522,22 +524,67 @@ impl Sess {
             state: Mutex::new(State {
                 messages,
                 active: None,
+                queued: Vec::new(),
             }),
         })
     }
 
-    pub fn open(&self, query: String) -> Result<Start> {
+    pub fn send(&self, query: String) -> Result<Outcome> {
         if query.trim().is_empty() {
             anyhow::bail!("message is empty");
         }
         let mut state = self.lock()?;
-        if state.active.is_some() {
-            anyhow::bail!("a turn is already running");
+        match state.active.clone() {
+            Some(active) => self
+                .queue(&mut state, active.call, query)
+                .map(|(call, event)| Outcome::Queued(call, event)),
+            None => self.open_locked(&mut state, query).map(Outcome::Started),
         }
+    }
+
+    /// Delivered to the orchestrator at its next decision point, never into a running subagent.
+    fn queue(
+        &self,
+        state: &mut MutexGuard<'_, State>,
+        call: Call,
+        query: String,
+    ) -> Result<(Call, Event)> {
+        let user = Message {
+            id: store::id("steer", 12)?,
+            turn_id: call.turn_id.clone(),
+            role: Role::User,
+            text: query.clone(),
+            status: None,
+            error: None,
+        };
+        let event = Event::Steered {
+            call: call.clone(),
+            user: user.clone(),
+        };
+        let mut next = (**state).clone();
+        next.messages.push(user);
+        next.queued.push(query);
+        self.commit(state, next, &event)?;
+        Ok((call, event))
+    }
+
+    pub fn drain(&self, call: &Call) -> Result<Vec<String>> {
+        let mut state = self.lock()?;
+        if state
+            .active
+            .as_ref()
+            .is_none_or(|active| active.call != *call)
+        {
+            return Ok(Vec::new());
+        }
+        Ok(std::mem::take(&mut state.queued))
+    }
+
+    fn open_locked(&self, state: &mut MutexGuard<'_, State>, query: String) -> Result<Start> {
         let transcript = transcript(&state.messages)?;
         let call = Call {
-            turn_id: id("turn")?,
-            request_id: id("request")?,
+            turn_id: store::id("turn", 12)?,
+            request_id: store::id("request", 12)?,
         };
         let user = Message {
             id: format!("{}_user", call.turn_id),
@@ -560,14 +607,14 @@ impl Sess {
             user: user.clone(),
             assistant: assistant.clone(),
         };
-        let mut next = state.clone();
+        let mut next = (**state).clone();
         next.messages.extend([user, assistant.clone()]);
         next.active = Some(Active {
             call: call.clone(),
             assistant: assistant.id,
             cancel: false,
         });
-        self.commit(&mut state, next, &event)?;
+        self.commit(state, next, &event)?;
         Ok(Start {
             call,
             query,
@@ -724,18 +771,6 @@ fn transcript(messages: &[Message]) -> Result<String> {
         })
         .collect();
     serde_json::to_string(&messages).context("serialize live transcript")
-}
-
-fn id(prefix: &str) -> Result<String> {
-    let mut bytes = [0_u8; 12];
-    getrandom::fill(&mut bytes)
-        .map_err(|error| anyhow::anyhow!("generate {prefix} id: {error}"))?;
-    let mut value = String::with_capacity(prefix.len() + 1 + bytes.len() * 2);
-    write!(value, "{prefix}_").context("write id prefix")?;
-    for byte in bytes {
-        write!(value, "{byte:02x}").context("encode id")?;
-    }
-    Ok(value)
 }
 
 #[cfg(test)]

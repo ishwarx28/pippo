@@ -4,7 +4,7 @@ use crate::{
     key::Key,
     proj::{Plan, Proj},
     rpc::{Interaction, Notice, Rpc, Stamped},
-    sess::{Call, Message, Sess, Status},
+    sess::{Call, Message, Outcome, Sess, Status},
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -170,7 +170,13 @@ pub fn listen(
 }
 
 fn send(app: &AppHandle, sess: &Sess, rpc: &Rpc, text: String) -> Result<Call> {
-    let start = sess.open(text)?;
+    let start = match sess.send(text)? {
+        Outcome::Queued(call, event) => {
+            app.emit(TURN_EVENT, event).context("emit queued message")?;
+            return Ok(call);
+        }
+        Outcome::Started(start) => start,
+    };
     if let Err(error) = app.emit(TURN_EVENT, &start.event) {
         sess.close(
             &start.call,

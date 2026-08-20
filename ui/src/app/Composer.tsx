@@ -28,14 +28,13 @@ export function Composer({
   const stop = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
-    if (running) stop.current?.focus();
-    else if (enabled) input.current?.focus();
-  }, [enabled, running]);
+    if (enabled) input.current?.focus();
+  }, [enabled]);
 
   function keyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
     event.preventDefault();
-    if (value.trim() && enabled && !running && !sending) onSend();
+    if (value.trim() && enabled && !sending) onSend();
   }
 
   return (
@@ -53,19 +52,22 @@ export function Composer({
         labelHidden
         value={value}
         placeholder={
-          running ? "Reply in progress" : enabled ? "Message pippo" : "Add a model key to continue"
+          running
+            ? "Add to the current turn"
+            : enabled
+              ? "Message pippo"
+              : "Add a model key to continue"
         }
-        disabled={running || !enabled}
+        disabled={!enabled}
         onChange={(event) => onChange(event.currentTarget.value)}
         onKeyDown={keyDown}
       />
-      {running ? (
+      <Button type="submit" tone="primary" disabled={!enabled || sending || !value.trim()}>
+        {sending ? "Sending…" : running ? "Queue" : "Send"}
+      </Button>
+      {running && (
         <Button ref={stop} type="button" tone="danger" disabled={stopping} onClick={onStop}>
           {stopping ? "Stopping…" : "Stop"}
-        </Button>
-      ) : (
-        <Button type="submit" tone="primary" disabled={!enabled || sending || !value.trim()}>
-          {sending ? "Sending…" : "Send"}
         </Button>
       )}
     </form>

@@ -20,6 +20,7 @@ fn shared(root: &Path) -> (Shared, mpsc::Receiver<Interaction>) {
             sheet: Mutex::new(SheetState::default()),
             key: Key::new(root.to_path_buf()),
             proj: Arc::new(Proj::open(root.to_path_buf()).unwrap()),
+            sess: Arc::new(Sess::new(crate::store::Store::open(root.to_path_buf()).unwrap()).unwrap()),
             runs: Runs::open(root.to_path_buf()).unwrap(),
             rules: rule::Book::open(root, root).unwrap(),
             reads: write::Reads::default(),

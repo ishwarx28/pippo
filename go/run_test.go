@@ -124,6 +124,9 @@ func runHarness(t *testing.T, provider model.Provider) (*runSet, *rpc, *runtimeR
 		"runtime.model_key": func(context.Context, *rpc, json.RawMessage) (any, error) {
 			return map[string]string{"value": "test-key"}, nil
 		},
+		"runtime.steer": func(context.Context, *rpc, json.RawMessage) (any, error) {
+			return map[string][]string{"messages": nil}, nil
+		},
 		"runtime.live_env": func(context.Context, *rpc, json.RawMessage) (any, error) {
 			return liveState{Date: "2026-08-20"}, nil
 		},

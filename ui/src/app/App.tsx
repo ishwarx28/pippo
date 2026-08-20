@@ -49,7 +49,14 @@ type Closed = {
   error?: string;
 };
 
-type TurnEvent = Opened | Chunk | Closed;
+type Steered = {
+  kind: "steered";
+  turn_id: string;
+  request_id: string;
+  user: Message;
+};
+
+type TurnEvent = Opened | Chunk | Closed | Steered;
 type KeyStatus = "missing" | "stored";
 type MessageAction = TurnEvent | { kind: "hydrate"; messages: Message[] };
 type InteractionEvent =
@@ -71,6 +78,9 @@ function applyEvent(messages: Message[], event: MessageAction): Message[] {
   if (event.kind === "opened") {
     const ids = new Set([event.user.id, event.assistant.id]);
     return [...messages.filter((message) => !ids.has(message.id)), event.user, event.assistant];
+  }
+  if (event.kind === "steered") {
+    return [...messages.filter((message) => message.id !== event.user.id), event.user];
   }
   return messages.map((message) => {
     if (message.id !== event.message_id || message.turn_id !== event.turn_id) return message;
@@ -125,6 +135,9 @@ export function App() {
             setDraft("");
             setError(undefined);
             setAnnouncement("Turn started");
+          } else if (payload.kind === "steered") {
+            setDraft("");
+            setAnnouncement("Message queued for this turn");
           } else if (payload.kind === "closed") {
             setStopping(false);
             setAnnouncement(
@@ -241,7 +254,7 @@ export function App() {
 
   async function send() {
     const text = draft.trim();
-    if (!text || keyStatus !== "stored" || running || sending) return;
+    if (!text || keyStatus !== "stored" || sending) return;
     const count = opened.current;
     setSending(true);
     setError(undefined);
@@ -354,7 +367,9 @@ export function App() {
         aria-live="polite"
         aria-busy={running}
       >
-        {messages.map((message) => <MessageView key={message.id} message={message} />)}
+        {messages.map((message) => (
+          <MessageView key={message.id} message={message} />
+        ))}
         {keyStatus === "missing" && (
           <ModelKeyCard
             value={keyDraft}

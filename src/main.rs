@@ -253,6 +253,7 @@ fn run() -> Result<()> {
         &rpc::Hello::new(&root, &cfg)?,
         key.clone(),
         Arc::clone(&proj),
+        Arc::clone(&sess),
         rules,
     )?;
     let notices = rpc.take_notices()?;
@@ -331,12 +332,14 @@ mod tests {
         cfg::load_at(root.clone()).unwrap();
         let hello = rpc::Hello::new(&root, &cfg::Config::default()).unwrap();
         let proj = Arc::new(proj::Proj::open(root.clone()).unwrap());
+        let sess = Arc::new(sess::Sess::new(store::Store::open(root.clone()).unwrap()).unwrap());
         let rpc = rpc::Rpc::connect(
             spawned.addr,
             spawned.token.clone(),
             &hello,
             key::Key::new(root.clone()),
             Arc::clone(&proj),
+            Arc::clone(&sess),
             rule::Book::open(&root, &root).unwrap(),
         )
         .unwrap();
@@ -346,6 +349,7 @@ mod tests {
             &hello,
             key::Key::new(root.clone()),
             proj,
+            sess,
             rule::Book::open(&root, &root).unwrap()
         )
         .is_err());
@@ -383,8 +387,11 @@ mod tests {
             token().unwrap()
         ));
         let store = store::Store::open(root.clone()).unwrap();
-        let sess = sess::Sess::new(store).unwrap();
-        let turn = sess.open("persist me".into()).unwrap();
+        let sess = Arc::new(sess::Sess::new(store).unwrap());
+        let turn = match sess.send("persist me".into()).unwrap() {
+            sess::Outcome::Started(start) => start,
+            sess::Outcome::Queued(..) => panic!("expected a new turn"),
+        };
         sess.chunk(&turn.call, "partial".into()).unwrap();
         let spawned = Service::spawn().unwrap();
         cfg::load_at(root.clone()).unwrap();
@@ -396,6 +403,7 @@ mod tests {
             &hello,
             key::Key::new(root.clone()),
             proj,
+            Arc::clone(&sess),
             rule::Book::open(&root, &root).unwrap(),
         )
         .unwrap();

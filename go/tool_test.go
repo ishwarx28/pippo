@@ -475,6 +475,9 @@ func TestLoopContinuesAfterTypedFailureAndDeduplicatesStreamedCall(t *testing.T)
 	defer server.Close()
 	var tasks atomic.Int32
 	client := dialRPCWith(t, server.URL, validToken, map[string]handler{
+		"runtime.steer": func(context.Context, *rpc, json.RawMessage) (any, error) {
+			return map[string][]string{"messages": nil}, nil
+		},
 		"runtime.live_env": func(context.Context, *rpc, json.RawMessage) (any, error) {
 			return liveState{Date: "2026-08-20"}, nil
 		},
