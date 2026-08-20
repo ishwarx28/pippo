@@ -54,6 +54,7 @@ func (Gemini) Stream(
 			if part.FunctionCall != nil {
 				chunk.Call = &Call{
 					ID: part.FunctionCall.ID, Name: part.FunctionCall.Name, Args: part.FunctionCall.Args,
+					Signature: part.ThoughtSignature,
 				}
 			}
 			if chunk.Text != "" || chunk.Call != nil {
@@ -103,9 +104,13 @@ func history(input []Message) []*genai.Content {
 			parts = append(parts, genai.NewPartFromText(message.Text))
 		}
 		for _, call := range message.Calls {
-			parts = append(parts, &genai.Part{FunctionCall: &genai.FunctionCall{
-				ID: call.ID, Name: call.Name, Args: call.Args,
-			}})
+			parts = append(parts, &genai.Part{
+				FunctionCall: &genai.FunctionCall{
+					ID: call.ID, Name: call.Name, Args: call.Args,
+				},
+				// Gemini rejects a replayed call whose thought signature is missing.
+				ThoughtSignature: call.Signature,
+			})
 		}
 		for _, result := range message.Results {
 			parts = append(parts, &genai.Part{FunctionResponse: &genai.FunctionResponse{

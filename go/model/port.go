@@ -62,6 +62,8 @@ type Call struct {
 	ID   string
 	Name string
 	Args map[string]any
+	// Opaque provider reasoning artifact, replayed verbatim and never compared or displayed.
+	Signature []byte `json:"-"`
 }
 
 type Result struct {

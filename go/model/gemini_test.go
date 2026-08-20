@@ -65,3 +65,20 @@ func TestGenerationConfigCarriesTemperatureAndReasoning(t *testing.T) {
 		}
 	}
 }
+
+func TestHistoryReplaysThoughtSignaturesOnFunctionCalls(t *testing.T) {
+	signature := []byte{9, 8, 7}
+	contents := history([]Message{
+		{Role: "model", Text: "calling", Calls: []Call{
+			{ID: "call-1", Name: "clarify", Signature: signature},
+			{ID: "call-2", Name: "find"},
+		}},
+	})
+	parts := contents[0].Parts
+	if len(parts) != 3 || !reflect.DeepEqual(parts[1].ThoughtSignature, signature) {
+		t.Fatalf("call parts = %#v", parts)
+	}
+	if parts[0].ThoughtSignature != nil || parts[2].ThoughtSignature != nil {
+		t.Fatalf("unsigned parts = %#v", parts)
+	}
+}
