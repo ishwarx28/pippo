@@ -210,9 +210,6 @@ pub fn load_at(root: PathBuf) -> Result<Config> {
     if !rules_path.exists() {
         fs::write(&rules_path, rule::DEFAULTS)
             .with_context(|| format!("write default config {}", rules_path.display()))?;
-    } else if fs::read_to_string(&rules_path)?.trim() == "rules: []" {
-        fs::write(&rules_path, rule::DEFAULTS)
-            .with_context(|| format!("upgrade default config {}", rules_path.display()))?;
     }
     fs::read(&rules_path).with_context(|| format!("read config {}", rules_path.display()))?;
 
@@ -302,8 +299,6 @@ mod tests {
             }"#,
         )
         .unwrap();
-        fs::write(dir.join("rules.yaml"), "rules: []\n").unwrap();
-
         let cfg = load_at(root.clone()).unwrap();
         assert_eq!(cfg.compact_at, 0.75);
         assert_eq!(cfg.max_steps.worker, 100);
