@@ -3,7 +3,7 @@
 use crate::{
     cfg::{self, Config},
     key::Key,
-    proj::{Proj, TaskStatus},
+    proj::{Plan, Proj, Step, StepStatus, TaskStatus},
     rule::{self, Decision, Request as RuleRequest},
     sess::{Call, RunCreate, RunMeta, RunReport, RunRole, RunStatus, Runs, Status},
     tool::{find, shell, write},
@@ -150,6 +150,9 @@ pub enum Interaction {
         id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    PlanChanged {
+        plan: Plan,
     },
 }
 
@@ -595,6 +598,7 @@ fn dispatch(
             "runtime.task" => task(&shared, input.params),
             "runtime.live_env" => live(&shared, input.params),
             "runtime.run" => run(&shared, input.params),
+            "runtime.plan" => plan(&shared, input.params),
             "runtime.find" => find(&shared, input.params),
             "runtime.write" => write(&shared, input.params),
             "runtime.edit" => edit(&shared, input.params),
@@ -1154,6 +1158,45 @@ fn run(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fai
             encode(meta, "run metadata")
         }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "lowercase")]
+#[serde(deny_unknown_fields)]
+enum PlanInput {
+    Create {
+        turn_id: String,
+        task_id: String,
+        goal: String,
+        steps: Vec<Step>,
+    },
+    Update {
+        task_id: String,
+        step_id: String,
+        status: StepStatus,
+        note: String,
+    },
+}
+
+fn plan(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
+    let plan = match decode(params, "plan request")? {
+        PlanInput::Create {
+            turn_id,
+            task_id,
+            goal,
+            steps,
+        } => shared.proj.plan_create(&task_id, &turn_id, goal, steps),
+        PlanInput::Update {
+            task_id,
+            step_id,
+            status,
+            note,
+        } => shared.proj.plan_update(&task_id, &step_id, status, note),
+    }
+    .map_err(invalid_failure)?;
+    let path = plan.path.clone();
+    let _ = emit_interaction(shared, Interaction::PlanChanged { plan });
+    encode(serde_json::json!({"ok": true, "path": path}), "plan result")
 }
 
 fn find(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {

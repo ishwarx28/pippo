@@ -8,6 +8,7 @@ import { ApprovalSheet, type ApprovalPrompt } from "./ApprovalSheet";
 import { Header } from "./Header";
 import { MessageView } from "./Message";
 import { ModelKeyCard } from "./ModelKeyCard";
+import { PlanView, type Plan } from "./PlanView";
 import "../ui/ui.css";
 import "./app.css";
 
@@ -55,7 +56,8 @@ type InteractionEvent =
   | { kind: "clarify_opened"; prompt: ClarifyPrompt }
   | { kind: "clarify_closed"; id: string; error?: string }
   | { kind: "approval_opened"; prompt: ApprovalPrompt }
-  | { kind: "approval_closed"; id: string; error?: string };
+  | { kind: "approval_closed"; id: string; error?: string }
+  | { kind: "plan_changed"; plan: Plan };
 
 function applyEvent(messages: Message[], event: MessageAction): Message[] {
   if (event.kind === "hydrate") {
@@ -100,6 +102,8 @@ export function App() {
   const [clarifyBusy, setClarifyBusy] = useState(false);
   const [approval, setApproval] = useState<ApprovalPrompt>();
   const [approvalBusy, setApprovalBusy] = useState(false);
+  const [plan, setPlan] = useState<Plan>();
+  const [planBusy, setPlanBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [announcement, setAnnouncement] = useState("");
   const opened = useRef(0);
@@ -174,6 +178,9 @@ export function App() {
             setApproval(payload.prompt);
             setApprovalBusy(false);
             setAnnouncement("Action needs your approval");
+          } else if (payload.kind === "plan_changed") {
+            setPlan(payload.plan);
+            setPlanBusy(false);
           } else {
             setApproval((current) => (current?.id === payload.id ? undefined : current));
             setApprovalBusy(false);
@@ -185,6 +192,8 @@ export function App() {
           return;
         }
         stop = unlisten;
+        const current = await invoke<Plan | null>("active_plan");
+        if (active && current) setPlan(current);
       } catch (reason) {
         if (active) setError(`Could not receive questions: ${detail(reason)}`);
       }
@@ -274,6 +283,19 @@ export function App() {
     }
   }
 
+  async function runPlan(command: string, args: Record<string, unknown>, failure: string) {
+    if (!plan || planBusy) return;
+    setPlanBusy(true);
+    setError(undefined);
+    try {
+      await invoke(command, { taskId: plan.task_id, ...args });
+    } catch (reason) {
+      setError(`${failure}: ${detail(reason)}`);
+    } finally {
+      setPlanBusy(false);
+    }
+  }
+
   async function answerClarify(answer: string) {
     if (!clarify || clarifyBusy) return;
     setClarifyBusy(true);
@@ -340,6 +362,14 @@ export function App() {
             error={keyError}
             onChange={setKeyDraft}
             onSubmit={() => void storeKey()}
+          />
+        )}
+        {plan && (
+          <PlanView
+            plan={plan}
+            busy={planBusy}
+            onProceed={() => void runPlan("proceed_plan", {}, "Could not start the plan")}
+            onSave={(text) => void runPlan("edit_plan", { text }, "Could not save the plan")}
           />
         )}
         {messages.length === 0 && keyStatus === "stored" && (

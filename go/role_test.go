@@ -116,16 +116,16 @@ func TestRoleDispatchDeniesUndeclaredToolsBeforeRPC(t *testing.T) {
 			t.Fatalf("%s/%s result = %#v", test.role, test.tool, result)
 		}
 	}
-	result := execTool(t.Context(), nil, nil, plannerRole, callID{}, "task", model.Call{
+	result := execTool(t.Context(), nil, nil, plannerRole, callID{}, "t_00000001", model.Call{
 		ID: "plan", Name: "plan", Args: map[string]any{
-			"action": "create", "task_id": "task", "goal": "goal",
+			"action": "create", "task_id": "t_00000002", "goal": "goal",
 			"steps": []any{map[string]any{
 				"title": "one", "detail": "detail", "files": []any{"a"},
 				"verify": "test", "risk": "none",
 			}},
 		},
 	})
-	if failureReason(result) != "busy" {
+	if failureReason(result) != "bad_args" {
 		t.Fatalf("plan result = %#v", result)
 	}
 }

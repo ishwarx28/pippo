@@ -2,11 +2,13 @@
 
 use crate::{
     key::Key,
+    proj::{Plan, Proj},
     rpc::{Interaction, Notice, Rpc, Stamped},
     sess::{Call, Message, Sess, Status},
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{collections::BTreeMap, sync::Arc, thread};
 use tauri::{AppHandle, Emitter, State};
 
@@ -68,6 +70,37 @@ pub async fn stop_turn(
     tauri::async_runtime::spawn_blocking(move || stop(&sess, &rpc))
         .await
         .map_err(|error| format!("stop task failed: {error}"))?
+        .map_err(message)
+}
+
+#[tauri::command]
+pub fn active_plan(proj: State<'_, Arc<Proj>>) -> std::result::Result<Option<Plan>, String> {
+    proj.active_plan().map_err(message)
+}
+
+#[tauri::command]
+pub fn edit_plan(
+    app: AppHandle,
+    proj: State<'_, Arc<Proj>>,
+    task_id: String,
+    text: String,
+) -> std::result::Result<(), String> {
+    let plan = proj.plan_edit(&task_id, &text).map_err(message)?;
+    announce_plan(&app, plan).map_err(message)
+}
+
+#[tauri::command]
+pub async fn proceed_plan(
+    app: AppHandle,
+    proj: State<'_, Arc<Proj>>,
+    rpc: State<'_, Rpc>,
+    task_id: String,
+) -> std::result::Result<(), String> {
+    let proj = Arc::clone(proj.inner());
+    let rpc = rpc.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || proceed(&app, &proj, &rpc, &task_id))
+        .await
+        .map_err(|error| format!("proceed task failed: {error}"))?
         .map_err(message)
 }
 
@@ -173,6 +206,29 @@ fn send(app: &AppHandle, sess: &Sess, rpc: &Rpc, text: String) -> Result<Call> {
             .context("finish queued cancellation")?;
     }
     Ok(start.call)
+}
+
+fn proceed(app: &AppHandle, proj: &Proj, rpc: &Rpc, task_id: &str) -> Result<()> {
+    let plan = proj.plan(task_id)?.context("this task has no plan")?;
+    if plan.proceeded {
+        anyhow::bail!("this plan is already being executed");
+    }
+    let _: Value = rpc
+        .call("run.resume", &serde_json::json!({"run_id": plan.run_id}))
+        .context("resume the planner")?;
+    announce_plan(
+        app,
+        proj.plan_proceed(task_id)
+            .and_then(|_| proj.plan(task_id))?,
+    )
+}
+
+fn announce_plan(app: &AppHandle, plan: impl Into<Option<Plan>>) -> Result<()> {
+    let Some(plan) = plan.into() else {
+        return Ok(());
+    };
+    app.emit(INTERACTION_EVENT, Interaction::PlanChanged { plan })
+        .context("emit plan change")
 }
 
 fn stop(sess: &Sess, rpc: &Rpc) -> Result<bool> {

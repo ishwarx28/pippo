@@ -16,6 +16,11 @@ import (
 
 const maxMediaBytes = 20 << 20
 
+// A plan is a proposal: the planner writes it and finishes until the user presses Proceed.
+const planStopReport = "Plan written. Waiting for the user to press Proceed."
+
+var errPlanWritten = errors.New("plan written")
+
 type runStatus string
 
 const (
@@ -104,6 +109,7 @@ type agentRun struct {
 	media     []numberedMedia
 	role      role
 	budget    guard
+	planned   bool
 }
 
 type runSet struct {
@@ -366,7 +372,8 @@ func (s *runSet) resume(ctx context.Context, parent string, args subagentArgs) (
 	restart := blocked || terminal(run.meta.Status)
 	attempt := run.meta.Attempt
 	history := append([]model.Message(nil), run.request.History...)
-	if run.report != "" {
+	// A planner that stopped on a plan already has that turn in its history.
+	if run.report != "" && !run.planned {
 		history = append(history, model.Message{Role: "model", Text: run.report})
 	}
 	if restart {
@@ -384,7 +391,7 @@ func (s *runSet) resume(ctx context.Context, parent string, args subagentArgs) (
 	}
 	run.request.History = history
 	run.meta.Status, run.meta.Attempt, run.report = runRunning, attempt, ""
-	run.questions = nil
+	run.questions, run.planned = nil, false
 	if restart {
 		run.budget = newGuard(run.role.Name, run.role.Steps)
 	}
@@ -508,7 +515,12 @@ func (s *runSet) execute(ctx context.Context, id string, epoch uint64) {
 	}
 	status := runDone
 	questions := []string(nil)
-	if err == nil {
+	if errors.Is(err, errPlanWritten) {
+		err, run.planned = nil, true
+		if strings.TrimSpace(run.report) == "" {
+			run.report = planStopReport
+		}
+	} else if err == nil {
 		var blocked bool
 		run.report, questions, blocked, err = blockedReport(run.report, run.role.Name)
 		if blocked {
@@ -604,7 +616,30 @@ func (s *runSet) run(
 		for _, notice := range notices {
 			request.History = append(request.History, model.Message{Role: "user", Text: notice})
 		}
+		if planCreated(reply.calls, results) {
+			return request, last, errPlanWritten
+		}
 	}
+}
+
+func planCreated(calls []model.Call, results []model.Result) bool {
+	for index, call := range calls {
+		if call.Name != planTool.Name || index >= len(results) {
+			continue
+		}
+		if action, _ := call.Args["action"].(string); action != "create" {
+			continue
+		}
+		if ok, _ := results[index].Data["ok"].(bool); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// Proceed: the runtime resumes a top-level run the user signed off on.
+func (s *runSet) reopen(id string) (runOutput, error) {
+	return s.resume(context.Background(), "", subagentArgs{Action: "resume", ID: id})
 }
 
 func (s *runSet) interrupt(peer *rpc) {

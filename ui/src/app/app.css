@@ -208,3 +208,69 @@
     animation: none;
   }
 }
+
+.plan__steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s4);
+  margin: 0;
+  padding-left: var(--s5);
+}
+
+.plan__step-title {
+  align-items: center;
+  display: flex;
+  font-weight: 500;
+  gap: var(--s2);
+  margin: 0;
+}
+
+.plan__dot {
+  background: var(--dim);
+  border-radius: 50%;
+  flex: none;
+  height: 6px;
+  width: 6px;
+}
+
+.plan__step--running .plan__dot {
+  background: var(--run);
+}
+
+.plan__step--done .plan__dot {
+  background: var(--good);
+}
+
+.plan__step--failed .plan__dot {
+  background: var(--bad);
+}
+
+.plan__status {
+  color: var(--dim);
+  font-size: var(--t-xs);
+  margin-left: auto;
+}
+
+.plan__detail {
+  color: var(--text);
+  margin: var(--s1) 0 0;
+}
+
+.plan__meta {
+  color: var(--dim);
+  display: grid;
+  font-size: var(--t-sm);
+  gap: 0 var(--s3);
+  grid-template-columns: max-content 1fr;
+  margin: var(--s2) 0 0;
+}
+
+.plan__meta dd {
+  margin: 0;
+}
+
+.plan__state {
+  color: var(--dim);
+  font-size: var(--t-sm);
+  margin: 0;
+}

@@ -1,6 +1,6 @@
 // Owns project registration and durable task state.
 
-use crate::store::atomic;
+use crate::store::{atomic, replace};
 use anyhow::{Context, Result};
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -100,11 +100,58 @@ impl Scope {
     }
 }
 
-#[derive(Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StepStatus {
+    #[default]
+    Todo,
+    Running,
+    Done,
+    Failed,
+    Skipped,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct Step {
+    #[serde(default)]
+    pub id: String,
+    pub title: String,
+    pub detail: String,
+    pub files: Vec<String>,
+    pub verify: String,
+    pub risk: String,
+    #[serde(default)]
+    pub status: StepStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct Plan {
+    pub task_id: String,
+    pub project_id: String,
+    pub run_id: String,
+    pub goal: String,
+    pub path: PathBuf,
+    pub proceeded: bool,
+    /// The file is the plan; `steps` is only its parse, so a hand edit round-trips as written.
+    pub text: String,
+    pub steps: Vec<Step>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(default)]
+struct PlanRef {
+    run_id: String,
+    proceeded: bool,
+}
+
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 struct SessionMeta {
     active_task: Option<String>,
     tasks: BTreeMap<String, Task>,
+    plans: BTreeMap<String, PlanRef>,
 }
 
 struct State {
@@ -175,7 +222,7 @@ impl Proj {
         };
         let mut next = SessionMeta {
             active_task: Some(id.clone()),
-            tasks: state.meta.tasks.clone(),
+            ..state.meta.clone()
         };
         next.tasks.insert(id.clone(), task);
         fs::create_dir_all(
@@ -214,7 +261,7 @@ impl Proj {
         }
         let mut next = SessionMeta {
             active_task: None,
-            tasks: state.meta.tasks.clone(),
+            ..state.meta.clone()
         };
         let task = next
             .tasks
@@ -337,6 +384,158 @@ impl Proj {
         })
     }
 
+    pub fn plan_create(
+        &self,
+        task_id: &str,
+        run_id: &str,
+        goal: String,
+        mut steps: Vec<Step>,
+    ) -> Result<Plan> {
+        let goal = goal.trim().to_string();
+        if goal.is_empty() || steps.is_empty() {
+            anyhow::bail!("a plan needs a goal and at least one step");
+        }
+        for (index, step) in steps.iter_mut().enumerate() {
+            step.id = format!("s{}", index + 1);
+            step.status = StepStatus::Todo;
+            step.note = None;
+            step.files.retain(|file| !file.trim().is_empty());
+            for field in [
+                &mut step.title,
+                &mut step.detail,
+                &mut step.verify,
+                &mut step.risk,
+            ] {
+                *field = field.trim().into();
+                if field.is_empty() || field.lines().any(|line| line.starts_with('#')) {
+                    anyhow::bail!("plan step fields must be filled and carry no markdown heading");
+                }
+            }
+        }
+        let mut state = self.lock()?;
+        let task = state
+            .meta
+            .tasks
+            .get(task_id)
+            .filter(|task| task.status == TaskStatus::Running)
+            .with_context(|| format!("task {task_id} is not open"))?;
+        let mut plan = Plan {
+            task_id: task_id.into(),
+            project_id: task.project_id.clone(),
+            run_id: run_id.into(),
+            goal,
+            path: plan_path(&task.project_id, task_id),
+            proceeded: false,
+            text: String::new(),
+            steps,
+        };
+        self.write_plan(&mut plan)?;
+        let mut next = state.meta.clone();
+        next.plans.insert(
+            task_id.into(),
+            PlanRef {
+                run_id: run_id.into(),
+                proceeded: false,
+            },
+        );
+        self.save(&next)?;
+        state.meta = next;
+        Ok(plan)
+    }
+
+    pub fn plan_update(
+        &self,
+        task_id: &str,
+        step_id: &str,
+        status: StepStatus,
+        note: String,
+    ) -> Result<Plan> {
+        let note = note.trim().to_string();
+        if note.is_empty() {
+            anyhow::bail!("a plan update needs a note");
+        }
+        let mut plan = self.plan(task_id)?.context("this task has no plan")?;
+        let step = plan
+            .steps
+            .iter_mut()
+            .find(|step| step.id == step_id)
+            .with_context(|| format!("plan has no step {step_id}"))?;
+        step.status = status;
+        step.note = Some(note);
+        self.write_plan(&mut plan)?;
+        Ok(plan)
+    }
+
+    /// The file is the plan: a hand edit by the user is read back as the new content.
+    pub fn plan(&self, task_id: &str) -> Result<Option<Plan>> {
+        let state = self.lock()?;
+        let (Some(reference), Some(task)) =
+            (state.meta.plans.get(task_id), state.meta.tasks.get(task_id))
+        else {
+            return Ok(None);
+        };
+        let path = plan_path(&task.project_id, task_id);
+        let text = fs::read_to_string(self.root.join(&path))
+            .with_context(|| format!("read plan {}", path.display()))?;
+        let (goal, steps) = parse_plan(&text);
+        Ok(Some(Plan {
+            task_id: task_id.into(),
+            project_id: task.project_id.clone(),
+            run_id: reference.run_id.clone(),
+            goal,
+            path,
+            proceeded: reference.proceeded,
+            text,
+            steps,
+        }))
+    }
+
+    pub fn active_plan(&self) -> Result<Option<Plan>> {
+        let active = self.lock()?.meta.active_task.clone();
+        match active {
+            Some(id) => self.plan(&id),
+            None => Ok(None),
+        }
+    }
+
+    pub fn plan_edit(&self, task_id: &str, text: &str) -> Result<Plan> {
+        let plan = self.plan(task_id)?.context("this task has no plan")?;
+        if plan.proceeded {
+            anyhow::bail!("a plan being executed cannot be rewritten by hand");
+        }
+        replace(&self.root.join(&plan.path), text.as_bytes())?;
+        self.plan(task_id)?.context("this task has no plan")
+    }
+
+    pub fn plan_proceed(&self, task_id: &str) -> Result<String> {
+        let mut state = self.lock()?;
+        let reference = state
+            .meta
+            .plans
+            .get(task_id)
+            .cloned()
+            .context("this task has no plan")?;
+        if reference.proceeded {
+            anyhow::bail!("this plan is already being executed");
+        }
+        let mut next = state.meta.clone();
+        next.plans.insert(
+            task_id.into(),
+            PlanRef {
+                proceeded: true,
+                ..reference.clone()
+            },
+        );
+        self.save(&next)?;
+        state.meta = next;
+        Ok(reference.run_id)
+    }
+
+    fn write_plan(&self, plan: &mut Plan) -> Result<()> {
+        plan.text = render_plan(plan);
+        replace(&self.root.join(&plan.path), plan.text.as_bytes())
+    }
+
     fn save(&self, meta: &SessionMeta) -> Result<()> {
         atomic(&self.root.join("session/meta.json"), meta)
     }
@@ -345,6 +544,112 @@ impl Proj {
         self.state
             .lock()
             .map_err(|_| anyhow::anyhow!("project state lock poisoned"))
+    }
+}
+
+fn plan_path(project: &str, task: &str) -> PathBuf {
+    PathBuf::from("projects")
+        .join(project)
+        .join("plans")
+        .join(format!("{task}.md"))
+}
+
+fn render_plan(plan: &Plan) -> String {
+    let mut text = format!("# {}\n", plan.goal);
+    for step in &plan.steps {
+        let _ = write!(
+            text,
+            "\n## {} · {}\n\n- status: {}\n- files: {}\n- verify: {}\n- risk: {}\n",
+            step.id,
+            step.title,
+            step.status.name(),
+            step.files.join(", "),
+            step.verify,
+            step.risk
+        );
+        if let Some(note) = &step.note {
+            let _ = writeln!(text, "- note: {note}");
+        }
+        if !step.detail.is_empty() {
+            let _ = writeln!(text, "\n{}", step.detail);
+        }
+    }
+    text
+}
+
+/// Forgiving on purpose: the user may edit this file by hand between two reads.
+fn parse_plan(text: &str) -> (String, Vec<Step>) {
+    let mut sections = text.split("\n## ");
+    let goal = sections
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+        .to_string();
+    let mut steps = Vec::new();
+    for (index, section) in sections.enumerate() {
+        let (head, body) = section.split_once('\n').unwrap_or((section, ""));
+        let (id, title) = match head.split_once('·') {
+            Some((id, title)) => (id.trim().to_string(), title.trim().to_string()),
+            None => (String::new(), head.trim().to_string()),
+        };
+        let mut step = Step {
+            id: if id.is_empty() {
+                format!("s{}", index + 1)
+            } else {
+                id
+            },
+            title,
+            ..Step::default()
+        };
+        let mut detail = Vec::new();
+        for line in body.lines() {
+            let field = line
+                .strip_prefix("- ")
+                .and_then(|rest| rest.split_once(':'))
+                .map(|(key, value)| (key.trim(), value.trim()));
+            match field {
+                Some(("status", value)) => step.status = StepStatus::parse(value),
+                Some(("files", value)) => {
+                    step.files = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|file| !file.is_empty())
+                        .map(String::from)
+                        .collect()
+                }
+                Some(("verify", value)) => step.verify = value.into(),
+                Some(("risk", value)) => step.risk = value.into(),
+                Some(("note", value)) => step.note = Some(value.into()),
+                _ => detail.push(line),
+            }
+        }
+        step.detail = detail.join("\n").trim().into();
+        steps.push(step);
+    }
+    (goal, steps)
+}
+
+impl StepStatus {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Todo => "todo",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "running" => Self::Running,
+            "done" => Self::Done,
+            "failed" => Self::Failed,
+            "skipped" => Self::Skipped,
+            _ => Self::Todo,
+        }
     }
 }
 

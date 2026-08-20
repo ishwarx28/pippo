@@ -359,6 +359,18 @@ func handlers(state *state) map[string]handler {
 		"shutdown": func(_ context.Context, _ *rpc, _ json.RawMessage) (any, error) {
 			return map[string]bool{"accepted": state.beginShutdown()}, nil
 		},
+		"run.resume": func(_ context.Context, _ *rpc, raw json.RawMessage) (any, error) {
+			var input struct {
+				RunID string `json:"run_id"`
+			}
+			if err := json.Unmarshal(raw, &input); err != nil || input.RunID == "" {
+				return nil, errors.New("run id is required")
+			}
+			if state.loop == nil {
+				return nil, errors.New("model loop is not ready")
+			}
+			return state.loop.agents.reopen(input.RunID)
+		},
 		"turn.start":  startTurn(state),
 		"turn.cancel": cancelTurn(state),
 	}

@@ -345,7 +345,7 @@ func TestEveryToolValidationFailureUsesOneTypedShape(t *testing.T) {
 		{workerRole, "bad_args", model.Call{ID: "write", Name: "write", Args: map[string]any{}}},
 		{workerRole, "bad_args", model.Call{ID: "edit", Name: "edit", Args: map[string]any{}}},
 		{workerRole, "bad_args", model.Call{ID: "shell", Name: "shell", Args: map[string]any{}}},
-		{plannerRole, "busy", model.Call{ID: "plan", Name: "plan", Args: map[string]any{
+		{plannerRole, "bad_args", model.Call{ID: "plan", Name: "plan", Args: map[string]any{
 			"action": "create", "task_id": "task", "goal": "goal", "steps": []any{map[string]any{
 				"title": "one", "detail": "detail", "files": []any{"a"}, "verify": "test", "risk": "none",
 			}},

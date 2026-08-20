@@ -213,8 +213,11 @@ type clarifyArgs struct {
 }
 
 type planStep struct {
-	Title, Detail, Verify, Risk string
-	Files                       []string `json:"files"`
+	Title  string   `json:"title"`
+	Detail string   `json:"detail"`
+	Files  []string `json:"files"`
+	Verify string   `json:"verify"`
+	Risk   string   `json:"risk"`
 }
 
 type planArgs struct {
@@ -225,6 +228,13 @@ type planArgs struct {
 	StepID string     `json:"step_id,omitempty"`
 	Status string     `json:"status,omitempty"`
 	Note   string     `json:"note,omitempty"`
+}
+
+// The run id owns the plan, so Proceed knows which run to resume.
+type planRequest struct {
+	TurnID string `json:"turn_id,omitempty"`
+	TaskID string `json:"task_id"`
+	planArgs
 }
 
 type clarifyRequest struct {
@@ -455,9 +465,18 @@ func execTool(
 		var args planArgs
 		if err := decodeArgs(call.Args, &args); err != nil || checkPlan(args) != nil {
 			failTool(&result, "bad_args", "invalid plan arguments")
-		} else {
-			failTool(&result, "busy", "plan storage is not available yet")
+			return result
 		}
+		if taskID == "" || (args.TaskID != "" && args.TaskID != taskID) {
+			failTool(&result, "bad_args", "a plan belongs to this run's own task")
+			return result
+		}
+		input := planRequest{TaskID: taskID, planArgs: args}
+		if args.Action == "create" {
+			input.TurnID = id.Turn
+		}
+		var output map[string]any
+		rpcTool(&result, peer.call(ctx, "runtime.plan", input, &output), output)
 	default:
 		failTool(&result, "bad_args", "unknown tool")
 	}
