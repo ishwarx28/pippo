@@ -47,6 +47,7 @@ fn search(query: &str) -> Input {
     Input {
         turn_id: None,
         request_id: None,
+        call_id: None,
         task_id: None,
         query: Some(query.into()),
         regex: false,
@@ -64,6 +65,7 @@ fn read(path: &str, range: Option<Range>) -> Input {
     Input {
         turn_id: None,
         request_id: None,
+        call_id: None,
         task_id: None,
         query: None,
         regex: false,

@@ -485,3 +485,52 @@ fn clarification_cancel_matches_the_originating_call() {
     close_shared(&shared, "stopped");
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn find_is_gated_by_the_rulebook() {
+    let root = std::env::temp_dir().join(format!("pippo-rpc-proj-{}-read", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let work = root.join("work");
+    std::fs::create_dir_all(work.join("src")).unwrap();
+    std::fs::write(work.join("src/main.rs"), b"needle\n").unwrap();
+    std::fs::create_dir_all(root.join(".pippo")).unwrap();
+    // The rulebook canonicalises home, so the request path has to match it.
+    let secret = std::fs::canonicalize(&root)
+        .unwrap()
+        .join(".pippo/auth.json");
+    std::fs::write(&secret, br#"{"gemini_api_key":"secret-value"}"#).unwrap();
+    let (shared, _interactions) = shared(&root);
+    task(
+        &shared,
+        Some(serde_json::json!({
+            "action": "create", "title": "read guarded paths", "path": work.clone()
+        })),
+    )
+    .unwrap();
+
+    let allowed = find(
+        &shared,
+        Some(serde_json::json!({
+            "turn_id": "run-a", "request_id": "request-a", "call_id": "find-a",
+            "path": "src/main.rs"
+        })),
+    )
+    .unwrap();
+    assert_eq!(allowed["ok"], true);
+
+    let denied = find(
+        &shared,
+        Some(serde_json::json!({
+            "turn_id": "run-a", "request_id": "request-a", "call_id": "find-b",
+            "path": secret
+        })),
+    )
+    .unwrap();
+    assert_eq!(denied["ok"], false);
+    assert_eq!(denied["error"]["reason"], "denied");
+    assert_eq!(
+        denied["error"]["message"],
+        "The model credential is never readable by a run"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}

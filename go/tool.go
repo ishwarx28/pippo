@@ -252,6 +252,7 @@ type findArgs struct {
 
 type findRequest struct {
 	callID
+	CallID string `json:"call_id"`
 	TaskID string `json:"task_id,omitempty"`
 	findArgs
 }
@@ -395,7 +396,11 @@ func execTool(
 			failTool(&result, "bad_args", err.Error())
 			return result
 		}
-		output, err := callFind(ctx, peer, findRequest{callID: id, TaskID: taskID, findArgs: args})
+		input := findRequest{callID: id, CallID: call.ID, TaskID: taskID, findArgs: args}
+		output, err := callFind(ctx, peer, input)
+		if err != nil && ctx.Err() != nil {
+			_ = peer.notify("runtime.approval.cancel", shellCancel{callID: id, CallID: call.ID})
+		}
 		rpcTool(&result, err, output)
 	case writeTool.Name:
 		var args writeArgs

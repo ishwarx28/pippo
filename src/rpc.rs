@@ -1247,6 +1247,25 @@ fn find(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fa
             })
         }
     };
+    let target = scope.resolve(input.path.as_deref().or(input.root.as_deref()));
+    if let Err(error) = gate(
+        shared,
+        RuleRequest {
+            tool: rule::Tool::Read,
+            role: None,
+            command: None,
+            path: &target,
+            project: scope.root(),
+            detail: "",
+        },
+        ApprovalKey {
+            turn: input.turn_id.clone().unwrap_or_default(),
+            request: input.request_id.clone().unwrap_or_default(),
+            call: input.call_id.clone().unwrap_or_default(),
+        },
+    ) {
+        return Ok(gated("find", error));
+    }
     let mut outcome = find::run(&scope, input);
     if outcome.result.ok {
         if let Some(key) = key {

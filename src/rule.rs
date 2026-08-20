@@ -21,6 +21,10 @@ rules:
 - { id: ask-recursive-delete, tool: shell, command: { kind: regex, value: '^rm[[:space:]]+(-[^[:space:]]*r[^[:space:]]*f|-[^[:space:]]*f[^[:space:]]*r)([[:space:]]|$)' }, action: ask, reason: Recursive force deletion is destructive }
 - { id: allow-inspection, tool: shell, command: { kind: regex, value: '^(pwd|ls|rg|grep|head|tail|cat|wc|stat|file)([[:space:]][^><;$`]*|)$|^git[[:space:]]+(status|diff|log|show)([[:space:]][^><;$`]*|)$|^git[[:space:]]+branch$' }, path: { kind: glob, value: '{project}/**' }, action: allow, reason: Project inspection is read-only }
 - { id: allow-build-test, tool: shell, command: { kind: regex, value: '^(cargo[[:space:]]+(build|check|test|clippy|fmt)|go[[:space:]]+(build|test|vet)|npm[[:space:]]+(test|run[[:space:]]+(build|test|lint))|pnpm[[:space:]]+(build|test|lint)|yarn[[:space:]]+(build|test|lint))([[:space:]][^><;$`]*|)$' }, path: { kind: glob, value: '{project}/**' }, action: allow, reason: Project build and test commands are expected verification }
+- { id: deny-credential-read, tool: read, path: { kind: glob, value: '{home}/.pippo/auth.json' }, action: deny, reason: The model credential is never readable by a run }
+- { id: allow-project-read, tool: read, path: { kind: glob, value: '{project}/**' }, action: allow, reason: Reads inside the active project are expected }
+- { id: allow-global-skills-read, tool: read, path: { kind: glob, value: '{home}/.pippo/skills/**' }, action: allow, reason: Global skill files are agent procedures }
+- { id: allow-project-skills-read, tool: read, path: { kind: glob, value: '{home}/.pippo/projects/*/skills/**' }, action: allow, reason: Project skill files are agent procedures }
 - { id: allow-project-write, tool: write, path: { kind: glob, value: '{project}/**' }, action: allow, reason: Writes inside the active project are expected }
 - { id: allow-project-edit, tool: edit, path: { kind: glob, value: '{project}/**' }, action: allow, reason: Edits inside the active project are expected }
 - { id: allow-global-skills-write, tool: write, path: { kind: glob, value: '{home}/.pippo/skills/**' }, action: allow, reason: Global skill files are agent procedures }
@@ -33,6 +37,7 @@ rules:
 #[serde(rename_all = "lowercase")]
 pub enum Tool {
     Shell,
+    Read,
     Write,
     Edit,
 }
@@ -59,6 +64,7 @@ impl Tool {
     fn name(self) -> &'static str {
         match self {
             Self::Shell => "shell",
+            Self::Read => "read",
             Self::Write => "write",
             Self::Edit => "edit",
         }

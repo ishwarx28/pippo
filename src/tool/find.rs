@@ -35,6 +35,7 @@ const IGNORED_DIRS: &[&str] = &[
 pub struct Input {
     pub turn_id: Option<String>,
     pub request_id: Option<String>,
+    pub call_id: Option<String>,
     pub task_id: Option<String>,
     pub query: Option<String>,
     #[serde(default)]
@@ -474,18 +475,28 @@ fn guard_resolved(path: &Path) -> std::result::Result<(), Failure> {
 }
 
 fn denied(path: &Path) -> bool {
-    path.components().any(|part| {
-        let name = part.as_os_str().to_string_lossy().to_ascii_lowercase();
-        name == ".ssh"
-            || name.starts_with(".env")
-            || matches!(
-                name.as_str(),
-                "id_dsa" | "id_ecdsa" | "id_ed25519" | "id_rsa" | "keystore"
-            )
-            || [".key", ".pem", ".p12", ".pfx"]
-                .iter()
-                .any(|suffix| name.ends_with(suffix))
-    })
+    credential(path)
+        || path.components().any(|part| {
+            let name = part.as_os_str().to_string_lossy().to_ascii_lowercase();
+            name == ".ssh"
+                || name.starts_with(".env")
+                || matches!(
+                    name.as_str(),
+                    "id_dsa" | "id_ecdsa" | "id_ed25519" | "id_rsa" | "keystore"
+                )
+                || [".key", ".pem", ".p12", ".pfx"]
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
+        })
+}
+
+// The model credential is a file now, so the read tool refuses it whatever the rulebook says.
+fn credential(path: &Path) -> bool {
+    let mut parts = path.components().rev();
+    parts
+        .next()
+        .is_some_and(|name| name.as_os_str().eq_ignore_ascii_case("auth.json"))
+        && parts.next().is_some_and(|dir| dir.as_os_str() == ".pippo")
 }
 
 fn ignored_dir(path: &Path) -> bool {

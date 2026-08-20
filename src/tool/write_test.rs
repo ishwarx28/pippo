@@ -56,6 +56,7 @@ fn read(reads: &Reads, scope: &Scope, key: Key, path: &str) {
         find::Input {
             turn_id: None,
             request_id: None,
+            call_id: None,
             task_id: None,
             query: None,
             regex: false,
