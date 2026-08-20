@@ -213,6 +213,7 @@ type shellRequest struct {
 	callID
 	CallID string `json:"call_id"`
 	TaskID string `json:"task_id,omitempty"`
+	Role   string `json:"role"`
 	shellArgs
 }
 
@@ -233,7 +234,7 @@ func declarations(tools []model.Tool) (string, error) {
 	return strings.Join(lines, "\n"), nil
 }
 
-func execTool(ctx context.Context, peer *rpc, id callID, taskID string, call model.Call) model.Result {
+func execTool(ctx context.Context, peer *rpc, role string, id callID, taskID string, call model.Call) model.Result {
 	result := model.Result{ID: call.ID, Name: call.Name}
 	switch call.Name {
 	case taskTool.Name:
@@ -328,7 +329,7 @@ func execTool(ctx context.Context, peer *rpc, id callID, taskID string, call mod
 			result.Data = map[string]any{"error": "invalid shell arguments"}
 			return result
 		}
-		input := shellRequest{callID: id, CallID: call.ID, TaskID: taskID, shellArgs: args}
+		input := shellRequest{callID: id, CallID: call.ID, TaskID: taskID, Role: role, shellArgs: args}
 		var output map[string]any
 		if err := peer.call(ctx, "runtime.shell", input, &output); err != nil {
 			if ctx.Err() != nil {

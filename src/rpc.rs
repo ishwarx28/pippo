@@ -1241,15 +1241,20 @@ fn shell(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, F
         .scope(input.task_id.as_deref())
         .map_err(internal_failure)?;
     let cwd = shell::policy_cwd(&scope, &input).map_err(tool_failure)?;
+    let detail = if input.env.is_empty() {
+        String::new()
+    } else {
+        format!("{:016x}", write::sig(format!("{:?}", input.env).as_bytes()))
+    };
     if let Err(error) = gate(
         shared,
         RuleRequest {
             tool: rule::Tool::Shell,
-            role: None,
+            role: Some(input.role),
             command: Some(&input.command),
             path: &cwd,
             project: scope.root(),
-            detail: "",
+            detail: &detail,
         },
         ApprovalKey {
             turn: input.turn_id.clone(),

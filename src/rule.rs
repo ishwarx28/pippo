@@ -37,6 +37,24 @@ pub enum Tool {
     Edit,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    Orchestrator,
+    Explorer,
+    Worker,
+}
+
+impl Role {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Orchestrator => "orchestrator",
+            Self::Explorer => "explorer",
+            Self::Worker => "worker",
+        }
+    }
+}
+
 impl Tool {
     fn name(self) -> &'static str {
         match self {
@@ -96,7 +114,7 @@ pub struct Book {
 
 pub struct Request<'a> {
     pub tool: Tool,
-    pub role: Option<&'a str>,
+    pub role: Option<Role>,
     pub command: Option<&'a str>,
     pub path: &'a Path,
     pub project: &'a Path,
@@ -184,6 +202,12 @@ impl Book {
     }
 
     pub fn decide(&self, request: Request<'_>) -> Decision {
+        if request.role == Some(Role::Explorer)
+            && request.tool == Tool::Shell
+            && (!request.detail.is_empty() || !read_only(request.command.unwrap_or_default()))
+        {
+            return Decision::Deny("Explorer commands must be read-only".into());
+        }
         let path = clean(request.path);
         if !within(&path, &self.home) {
             return Decision::Deny("Paths outside the home directory are refused".into());
@@ -300,9 +324,7 @@ impl Pattern {
 }
 
 fn segments(command: &str) -> Vec<String> {
-    let mut values = Vec::new();
-    let mut start = 0;
-    let mut quote = None;
+    let (mut values, mut start, mut quote) = (Vec::new(), 0, None);
     let bytes = command.as_bytes();
     let mut at = 0;
     while at < bytes.len() {
@@ -329,6 +351,244 @@ fn segments(command: &str) -> Vec<String> {
     values
 }
 
+fn read_only(command: &str) -> bool {
+    words(command).is_some_and(|parts| !parts.is_empty() && parts.iter().all(|part| inspect(part)))
+}
+
+fn words(command: &str) -> Option<Vec<Vec<String>>> {
+    let (mut parts, mut part, mut word) = (Vec::new(), Vec::new(), String::new());
+    let (mut quote, mut started, mut chained) = (None, false, false);
+    let mut chars = command.chars().peekable();
+    while let Some(value) = chars.next() {
+        if quote == Some('\'') {
+            if value == '\'' {
+                quote = None;
+            } else {
+                word.push(value);
+            }
+            continue;
+        }
+        if value == '\\' {
+            word.push(chars.next()?);
+            started = true;
+        } else if value == '\'' && quote.is_none() {
+            quote = Some(value);
+            started = true;
+        } else if value == '"' {
+            if quote == Some(value) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(value);
+                started = true;
+            } else {
+                word.push(value);
+            }
+        } else if value == '`'
+            || value == '$' && chars.peek() == Some(&'(')
+            || quote.is_none() && matches!(value, '<' | '>')
+        {
+            return None;
+        } else if quote.is_none() && (value.is_whitespace() || matches!(value, '|' | ';' | '&')) {
+            if started {
+                part.push(std::mem::take(&mut word));
+                started = false;
+            }
+            if matches!(value, '|' | ';' | '&') || value == '\n' {
+                if value == '&' && chars.peek() != Some(&'&') {
+                    return None;
+                }
+                if value == '|' && chars.peek() == Some(&'&') || chars.peek() == Some(&value) {
+                    chars.next();
+                }
+                if part.is_empty() {
+                    return None;
+                }
+                parts.push(std::mem::take(&mut part));
+                chained = value != '\n';
+            }
+        } else {
+            word.push(value);
+            started = true;
+            chained = false;
+        }
+    }
+    if quote.is_some() || chained {
+        return None;
+    }
+    if started {
+        part.push(word);
+    }
+    if !part.is_empty() {
+        parts.push(part);
+    }
+    Some(parts)
+}
+
+fn inspect(words: &[String]) -> bool {
+    let Some(command) = words.first().map(String::as_str) else {
+        return false;
+    };
+    let command = command
+        .strip_prefix("/usr/bin/")
+        .or_else(|| command.strip_prefix("/bin/"))
+        .unwrap_or(command);
+    let args = &words[1..];
+    match command {
+        "pwd" | "ls" | "grep" | "head" | "tail" | "cat" | "wc" | "stat" | "du" | "df" | "which"
+        | "whereis" | "realpath" | "readlink" | "md5" | "shasum" | "cut" | "tr" | "diff"
+        | "cmp" | "jq" | "ps" | "pgrep" | "lsof" | "uname" | "sw_vers" | "printenv" | "type"
+        | "true" | "false" | "test" | "[" | "echo" | "printf" | "cd" => true,
+        "rg" => !args
+            .iter()
+            .any(|arg| arg == "--pre" || arg.starts_with("--pre=")),
+        "file" => !args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-C" | "--compile")),
+        "find" => !args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "-delete"
+                    | "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-fprint"
+                    | "-fprint0"
+                    | "-fprintf"
+                    | "-fls"
+            )
+        }),
+        "command" => args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "-v" | "-V")),
+        "env" => args
+            .iter()
+            .all(|arg| matches!(arg.as_str(), "-0" | "--null" | "--help" | "--version")),
+        "git" => git(args),
+        "cargo" => query(args, &["metadata", "tree", "locate-project", "pkgid"]),
+        "go" => {
+            (query(args, &["list", "doc", "version"])
+                && !args
+                    .iter()
+                    .any(|arg| arg == "-toolexec" || arg.starts_with("-toolexec=")))
+                || env_query(args)
+        }
+        "npm" => query(args, &["list", "ls", "view", "info"]) || npm_config(args),
+        "rustc" | "node" => {
+            !args.is_empty()
+                && args
+                    .iter()
+                    .all(|arg| matches!(arg.as_str(), "-v" | "-V" | "--version"))
+        }
+        "python" | "python3" => args == ["--version"] || args == ["-V"],
+        _ => false,
+    }
+}
+
+fn query(args: &[String], commands: &[&str]) -> bool {
+    args.first()
+        .is_some_and(|arg| arg == "--version" || arg == "-V" || commands.contains(&arg.as_str()))
+}
+
+fn env_query(args: &[String]) -> bool {
+    args.first().is_some_and(|arg| arg == "env")
+        && !args.iter().any(|arg| matches!(arg.as_str(), "-w" | "-u"))
+}
+
+fn npm_config(args: &[String]) -> bool {
+    args.first().is_some_and(|arg| arg == "config")
+        && args.get(1).is_some_and(|arg| arg == "get" || arg == "list")
+}
+
+fn git(args: &[String]) -> bool {
+    let mut at = 0;
+    while let Some(arg) = args.get(at) {
+        match arg.as_str() {
+            "-C" => at += 2,
+            "--no-pager" | "--literal-pathspecs" | "--no-literal-pathspecs" => at += 1,
+            value if value.starts_with("--git-dir=") || value.starts_with("--work-tree=") => {
+                at += 1
+            }
+            _ => break,
+        }
+    }
+    let Some(command) = args.get(at).map(String::as_str) else {
+        return false;
+    };
+    let rest = &args[at + 1..];
+    if rest.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--output" | "--ext-diff" | "--textconv" | "--filters"
+        ) || arg.starts_with("--output=")
+    }) {
+        return false;
+    }
+    match command {
+        "status" | "diff" | "log" | "show" | "rev-parse" | "ls-files" | "ls-tree" | "cat-file"
+        | "describe" => true,
+        "branch" => list_args(rest, &["--show-current", "-a", "-r", "-v", "-vv"]),
+        "tag" => list_args(rest, &[]),
+        "config" => git_config(rest),
+        "remote" => remote(rest),
+        "reflog" => rest.first().is_some_and(|arg| arg == "show"),
+        _ => false,
+    }
+}
+
+fn remote(args: &[String]) -> bool {
+    args.is_empty()
+        || args == ["-v"]
+        || args.first().is_some_and(|arg| arg == "get-url")
+        || args.first().is_some_and(|arg| arg == "show")
+            && args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "-n" | "--no-query"))
+}
+
+fn list_args(args: &[String], safe: &[&str]) -> bool {
+    if args.is_empty() {
+        return true;
+    }
+    let listed = args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-l" | "--list"));
+    listed
+        && args.iter().all(|arg| {
+            !arg.starts_with('-')
+                || matches!(arg.as_str(), "-l" | "--list")
+                || safe.contains(&arg.as_str())
+        })
+        || args.iter().all(|arg| safe.contains(&arg.as_str()))
+}
+
+fn git_config(args: &[String]) -> bool {
+    let mut values = 0;
+    let mut skip = false;
+    for arg in args {
+        if skip {
+            skip = false;
+        } else if matches!(arg.as_str(), "--file" | "-f") {
+            skip = true;
+        } else if matches!(
+            arg.as_str(),
+            "--add"
+                | "--replace-all"
+                | "--unset"
+                | "--unset-all"
+                | "--remove-section"
+                | "--rename-section"
+                | "--edit"
+                | "-e"
+        ) {
+            return false;
+        } else if !arg.starts_with('-') {
+            values += 1;
+        }
+    }
+    !skip && values <= 1
+}
+
 fn clean(path: &Path) -> PathBuf {
     path.components().collect()
 }
@@ -346,7 +606,7 @@ fn fingerprint(request: &Request<'_>, path: &Path) -> String {
     format!(
         "{}\0{}\0{}\0{}\0{}",
         request.tool.name(),
-        request.role.unwrap_or(""),
+        request.role.map_or("", Role::name),
         request.command.unwrap_or(""),
         slash(path),
         request.detail

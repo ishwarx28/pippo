@@ -43,6 +43,7 @@ fn input(command: &str) -> Input {
         request_id: "request-a".into(),
         call_id: "shell-a".into(),
         task_id: None,
+        role: crate::rule::Role::Worker,
         command: command.into(),
         cwd: None,
         timeout: None,

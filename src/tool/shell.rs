@@ -1,6 +1,6 @@
 // Owns bounded foreground command execution and process-group termination.
 
-use crate::{proj::Scope, tool::find};
+use crate::{proj::Scope, rule::Role, tool::find};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -39,6 +39,7 @@ pub struct Input {
     pub request_id: String,
     pub call_id: String,
     pub task_id: Option<String>,
+    pub role: Role,
     pub command: String,
     pub cwd: Option<PathBuf>,
     pub timeout: Option<u64>,

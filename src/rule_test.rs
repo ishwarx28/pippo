@@ -14,14 +14,168 @@ fn decide(
     project: &str,
     detail: &str,
 ) -> Decision {
+    decide_as(book, None, tool, command, path, project, detail)
+}
+
+fn decide_as(
+    book: &Book,
+    role: Option<Role>,
+    tool: Tool,
+    command: Option<&str>,
+    path: &str,
+    project: &str,
+    detail: &str,
+) -> Decision {
     book.decide(Request {
         tool,
-        role: None,
+        role,
         command,
         path: Path::new(path),
         project: Path::new(project),
         detail,
     })
+}
+
+#[test]
+fn explorer_shell_is_strictly_read_only_before_rules_and_sessions() {
+    let rules = book(
+        r#"rules:
+- { id: anything, tool: shell, command: { kind: regex, value: '.*' }, action: allow, reason: user allowed }
+"#,
+    );
+    for command in [
+        "pwd",
+        "ls -la | rg src | head -20",
+        "git -C . --no-pager status && git diff -- src",
+        "git branch --list 'feat/*'",
+        "git tag -l 'v*'",
+        "git config --global --get user.name",
+        "git remote show -n origin",
+        "find src -type f -print",
+        "printf '%s\\n' 'a>b' | wc -l",
+        "echo '$(touch safe-literal)'",
+        "command -v cargo",
+        "cargo metadata --no-deps",
+        "go list ./...",
+        "go env GOPATH",
+        "npm config get registry",
+        "cd src && pwd",
+    ] {
+        assert!(
+            matches!(
+                decide_as(
+                    &rules,
+                    Some(Role::Explorer),
+                    Tool::Shell,
+                    Some(command),
+                    "/home/me/project",
+                    "/home/me/project",
+                    ""
+                ),
+                Decision::Allow
+            ),
+            "allowed: {command}"
+        );
+    }
+    for command in [
+        "touch changed",
+        "pwd > changed",
+        "cat < input",
+        "rg x | tee changed",
+        "pwd && rm -rf changed",
+        "echo \"$(touch changed)\"",
+        "echo `touch changed`",
+        "find . -delete",
+        "find . -fprint0 changed",
+        "find . -exec rm {} +",
+        "rg --pre 'touch changed' needle",
+        "file -C magic",
+        "sed -n '1,20p' file",
+        "sed -i old file",
+        "sort -o changed input",
+        "git branch new",
+        "git branch -D old",
+        "git tag v1",
+        "git config user.name value",
+        "git remote add origin url",
+        "git remote show origin",
+        "git diff --output=changed",
+        "git diff --ext-diff",
+        "git --paginate log",
+        "git fetch origin",
+        "cargo check",
+        "cargo test",
+        "go test ./...",
+        "go vet ./...",
+        "go list -toolexec 'touch changed' ./...",
+        "npm install pkg",
+        "npm test",
+        "sh -c 'pwd'",
+        "env rm changed",
+        "env -S 'rm changed'",
+        "command rm changed",
+        "MODE=x rg needle",
+        "pwd &",
+        "pwd || touch changed",
+        "printf 'unterminated",
+    ] {
+        assert!(
+            matches!(
+                decide_as(
+                    &rules,
+                    Some(Role::Explorer),
+                    Tool::Shell,
+                    Some(command),
+                    "/home/me/project",
+                    "/home/me/project",
+                    ""
+                ),
+                Decision::Deny(reason) if reason == "Explorer commands must be read-only"
+            ),
+            "denied: {command}"
+        );
+    }
+
+    let asked = book(
+        r#"rules:
+- { id: mutation, tool: shell, command: { kind: literal, value: 'touch changed' }, action: ask, reason: ask }
+"#,
+    );
+    let Decision::Ask(approval) = decide_as(
+        &asked,
+        Some(Role::Worker),
+        Tool::Shell,
+        Some("touch changed"),
+        "/home/me/project",
+        "/home/me/project",
+        "",
+    ) else {
+        panic!("worker mutation did not ask")
+    };
+    asked.allow_session(&approval).unwrap();
+    assert!(matches!(
+        decide_as(
+            &asked,
+            Some(Role::Explorer),
+            Tool::Shell,
+            Some("touch changed"),
+            "/home/me/project",
+            "/home/me/project",
+            ""
+        ),
+        Decision::Deny(_)
+    ));
+    assert!(matches!(
+        rules.decide(Request {
+            tool: Tool::Shell,
+            role: Some(Role::Explorer),
+            command: Some("pwd"),
+            path: Path::new("/home/me/project"),
+            project: Path::new("/home/me/project"),
+            detail: "environment override",
+        }),
+        Decision::Deny(_)
+    ));
 }
 
 #[test]

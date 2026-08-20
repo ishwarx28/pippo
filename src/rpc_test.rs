@@ -158,6 +158,7 @@ fn shell_requests_execute_in_the_active_task_scope() {
         &shared,
         Some(serde_json::json!({
             "turn_id": "run-a", "request_id": "request-a", "call_id": "shell-a",
+            "role": "worker",
             "command": "pwd", "env": {"RPC_VALUE": "present"}
         })),
     )

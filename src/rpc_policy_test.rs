@@ -86,6 +86,46 @@ fn write_request(path: &Path, call: &str, content: &str) -> Value {
 }
 
 #[test]
+fn explorer_mutation_is_denied_without_an_interaction() {
+    let harness = Harness::new();
+    let changed = harness.work.join("changed");
+    let result = shell(
+        &harness.shared,
+        Some(serde_json::json!({
+            "turn_id": "run-explore", "request_id": "request-explore", "call_id": "shell-mutate",
+            "role": "explorer", "command": "pwd | cat && touch changed"
+        })),
+    )
+    .unwrap();
+    assert_eq!(result["error"]["reason"], "denied");
+    assert!(!changed.exists());
+    assert!(harness.events.try_recv().is_err());
+
+    let environment = shell(
+        &harness.shared,
+        Some(serde_json::json!({
+            "turn_id": "run-explore", "request_id": "request-env", "call_id": "shell-env",
+            "role": "explorer", "command": "pwd", "env": {"PAGER": "touch changed"}
+        })),
+    )
+    .unwrap();
+    assert_eq!(environment["error"]["reason"], "denied");
+    assert!(!changed.exists());
+    assert!(harness.events.try_recv().is_err());
+
+    let inspected = shell(
+        &harness.shared,
+        Some(serde_json::json!({
+            "turn_id": "run-explore", "request_id": "request-inspect", "call_id": "shell-inspect",
+            "role": "explorer", "command": "pwd | cat"
+        })),
+    )
+    .unwrap();
+    assert_eq!(inspected["ok"], true);
+    assert!(harness.events.try_recv().is_err());
+}
+
+#[test]
 fn write_waits_before_side_effect_and_session_allow_is_exact() {
     let harness = Harness::new();
     let outside = harness.root.join("outside");
@@ -146,6 +186,7 @@ fn cancellation_late_answers_and_concurrent_sheets_fail_closed() {
             &shared,
             Some(serde_json::json!({
                 "turn_id": "run-b", "request_id": "request-b", "call_id": "shell-one",
+                "role": "worker",
                 "command": "touch changed"
             })),
         )
