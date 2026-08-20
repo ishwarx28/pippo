@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod cfg;
+mod key;
 mod rpc;
 mod store;
 
@@ -130,9 +131,15 @@ fn run() -> Result<()> {
     let rpc = rpc::Rpc::connect(spawned.addr, spawned.token, &rpc::Hello::new(&root, &cfg)?)?;
     tauri::Builder::default()
         .manage(cfg)
+        .manage(key::Key)
         .manage(store)
         .manage(rpc)
         .manage(spawned.service)
+        .invoke_handler(tauri::generate_handler![
+            key::model_key_status,
+            key::store_model_key,
+            key::clear_model_key
+        ])
         .run(tauri::generate_context!())
         .map_err(Into::into)
 }
