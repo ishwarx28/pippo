@@ -5,6 +5,7 @@ import { useEffect, useReducer, useRef, useState } from "react";
 import { Composer } from "./Composer";
 import { Header } from "./Header";
 import { MessageView } from "./Message";
+import { ModelKeyCard } from "./ModelKeyCard";
 import "../ui/ui.css";
 import "./app.css";
 
@@ -46,6 +47,7 @@ type Closed = {
 };
 
 type TurnEvent = Opened | Chunk | Closed;
+type KeyStatus = "missing" | "stored";
 type MessageAction = TurnEvent | { kind: "hydrate"; messages: Message[] };
 
 function applyEvent(messages: Message[], event: MessageAction): Message[] {
@@ -80,6 +82,10 @@ function detail(error: unknown): string {
 export function App() {
   const [messages, dispatch] = useReducer(applyEvent, []);
   const [draft, setDraft] = useState("");
+  const [keyDraft, setKeyDraft] = useState("");
+  const [keyStatus, setKeyStatus] = useState<KeyStatus>();
+  const [keySaving, setKeySaving] = useState(false);
+  const [keyError, setKeyError] = useState<string>();
   const [sending, setSending] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [error, setError] = useState<string>();
@@ -133,12 +139,42 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    let active = true;
+    let stop: (() => void) | undefined;
+    async function checkKey() {
+      try {
+        const unlisten = await listen<KeyStatus>("model-key-status", ({ payload }) => {
+          if (!active) return;
+          setKeyDraft("");
+          setKeyStatus(payload);
+          setKeyError(undefined);
+          setAnnouncement(payload === "stored" ? "Model key stored" : "Model key required");
+        });
+        if (!active) {
+          unlisten();
+          return;
+        }
+        stop = unlisten;
+        const status = await invoke<KeyStatus>("model_key_status");
+        if (active) setKeyStatus(status);
+      } catch (reason) {
+        if (active) setError(`Could not check model access: ${detail(reason)}`);
+      }
+    }
+    void checkKey();
+    return () => {
+      active = false;
+      stop?.();
+    };
+  }, []);
+
+  useEffect(() => {
     end.current?.scrollIntoView({ block: "end" });
-  }, [messages]);
+  }, [keyStatus, messages]);
 
   async function send() {
     const text = draft.trim();
-    if (!text || running || sending) return;
+    if (!text || keyStatus !== "stored" || running || sending) return;
     const count = opened.current;
     setSending(true);
     setError(undefined);
@@ -148,6 +184,22 @@ export function App() {
       if (opened.current === count) setError(`Could not send message: ${detail(reason)}`);
     } finally {
       setSending(false);
+    }
+  }
+
+  async function storeKey() {
+    const value = keyDraft.trim();
+    if (!value || keySaving) return;
+    setKeySaving(true);
+    setKeyError(undefined);
+    setKeyDraft("");
+    try {
+      const status = await invoke<KeyStatus>("store_model_key", { value });
+      if (status === "stored") setAnnouncement("Model key stored");
+    } catch {
+      setKeyError("Could not store the model key. Try again.");
+    } finally {
+      setKeySaving(false);
     }
   }
 
@@ -173,10 +225,23 @@ export function App() {
         aria-live="polite"
         aria-busy={running}
       >
-        {messages.length === 0 ? (
+        {messages.map((message) => <MessageView key={message.id} message={message} />)}
+        {keyStatus === "missing" && (
+          <ModelKeyCard
+            value={keyDraft}
+            saving={keySaving}
+            error={keyError}
+            onChange={setKeyDraft}
+            onSubmit={() => void storeKey()}
+          />
+        )}
+        {messages.length === 0 && keyStatus === "stored" && (
           <p className="transcript__empty">What shall we work on?</p>
-        ) : (
-          messages.map((message) => <MessageView key={message.id} message={message} />)
+        )}
+        {messages.length === 0 && keyStatus === undefined && (
+          <p className="transcript__empty" role="status">
+            Checking model access…
+          </p>
         )}
         <div ref={end} />
       </section>
@@ -187,6 +252,7 @@ export function App() {
       )}
       <Composer
         value={draft}
+        enabled={keyStatus === "stored"}
         running={running}
         sending={sending}
         stopping={stopping}

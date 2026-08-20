@@ -44,6 +44,10 @@ impl Key {
         })
     }
 
+    pub fn is_stored(&self) -> Result<bool> {
+        Ok(self.status()? == Status::Stored)
+    }
+
     fn store(&self, value: String) -> Result<Status> {
         let value = validate(value)?;
         entry()?

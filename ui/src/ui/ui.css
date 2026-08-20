@@ -35,7 +35,7 @@
   min-width: var(--r);
 }
 
-.field__label,
+.field__label--hidden,
 .sr-only {
   position: absolute;
   width: var(--a11y-size);
@@ -51,15 +51,36 @@
 .field__input {
   display: block;
   width: var(--full);
-  min-height: var(--composer-input-min);
-  max-height: var(--composer-input-max);
+  min-height: var(--hit);
   padding: var(--s2) var(--s3);
-  resize: vertical;
+  resize: none;
   border: var(--line-w) solid var(--line);
   border-radius: var(--r-sm);
   color: var(--text);
   background: var(--surface);
   font: 400 var(--t-md) var(--sans);
+}
+
+.field__input--multiline {
+  min-height: var(--composer-input-min);
+  max-height: var(--composer-input-max);
+  resize: vertical;
+}
+
+.field__label {
+  display: block;
+  margin-bottom: var(--s1);
+  color: var(--dim);
+  font: 500 var(--t-sm) var(--sans);
+}
+
+.field__error {
+  display: block;
+  margin-top: var(--s1);
+  padding-left: var(--s2);
+  border-left: var(--focus-w) solid var(--bad);
+  color: var(--bad);
+  font: 400 var(--t-sm) var(--sans);
 }
 
 .field__input::placeholder {
@@ -69,4 +90,37 @@
 .field__input:disabled {
   cursor: not-allowed;
   opacity: var(--disabled-opacity);
+}
+
+.card {
+  width: var(--full);
+  border: var(--line-w) solid var(--line);
+  background: var(--surface);
+}
+
+.card--wait {
+  border-left: var(--focus-w) solid var(--wait);
+}
+
+.card--bad {
+  border-left: var(--focus-w) solid var(--bad);
+}
+
+.card__header {
+  padding: var(--s3);
+  border-bottom: var(--line-w) solid var(--line);
+}
+
+.card__title {
+  margin: var(--r);
+  font: 600 var(--t-lg) var(--sans);
+}
+
+.card__body {
+  padding: var(--s3);
+}
+
+.card__footer {
+  padding: var(--s3);
+  border-top: var(--line-w) solid var(--line);
 }

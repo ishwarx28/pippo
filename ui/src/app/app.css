@@ -59,6 +59,21 @@
   color: var(--dim);
 }
 
+.model-key-card__copy {
+  margin: var(--r) var(--r) var(--s3);
+  color: var(--dim);
+}
+
+.model-key-card__form {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--s2);
+}
+
+.model-key-card__form .field {
+  flex: var(--grow);
+}
+
 .message {
   width: var(--full);
   margin: var(--r);

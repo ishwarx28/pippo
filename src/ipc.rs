@@ -1,6 +1,7 @@
 // Owns UI commands and delivery of runtime events.
 
 use crate::{
+    key::Key,
     rpc::{Notice, Rpc, Stamped},
     sess::{Call, Message, Sess, Status},
 };
@@ -40,10 +41,14 @@ pub fn session_snapshot(sess: State<'_, Arc<Sess>>) -> std::result::Result<Vec<M
 #[tauri::command]
 pub async fn send_message(
     app: AppHandle,
+    key: State<'_, Key>,
     sess: State<'_, Arc<Sess>>,
     rpc: State<'_, Rpc>,
     text: String,
 ) -> std::result::Result<Call, String> {
+    if !key.is_stored().map_err(message)? {
+        return Err("model key is missing".into());
+    }
     let sess = Arc::clone(sess.inner());
     let rpc = rpc.inner().clone();
     tauri::async_runtime::spawn_blocking(move || send(&app, &sess, &rpc, text))

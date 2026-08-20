@@ -5,6 +5,7 @@ import { Field } from "../ui/Field";
 
 type Props = {
   value: string;
+  enabled: boolean;
   running: boolean;
   sending: boolean;
   stopping: boolean;
@@ -15,6 +16,7 @@ type Props = {
 
 export function Composer({
   value,
+  enabled,
   running,
   sending,
   stopping,
@@ -27,13 +29,13 @@ export function Composer({
 
   useEffect(() => {
     if (running) stop.current?.focus();
-    else input.current?.focus();
-  }, [running]);
+    else if (enabled) input.current?.focus();
+  }, [enabled, running]);
 
   function keyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     if (event.key !== "Enter" || event.shiftKey || event.nativeEvent.isComposing) return;
     event.preventDefault();
-    if (value.trim() && !running && !sending) onSend();
+    if (value.trim() && enabled && !running && !sending) onSend();
   }
 
   return (
@@ -48,10 +50,12 @@ export function Composer({
         ref={input}
         id="message"
         label="Message"
+        labelHidden
         value={value}
-        placeholder={running ? "Reply in progress" : "Message pippo"}
-        disabled={running}
-        autoFocus
+        placeholder={
+          running ? "Reply in progress" : enabled ? "Message pippo" : "Add a model key to continue"
+        }
+        disabled={running || !enabled}
         onChange={(event) => onChange(event.currentTarget.value)}
         onKeyDown={keyDown}
       />
@@ -60,7 +64,7 @@ export function Composer({
           {stopping ? "Stopping…" : "Stop"}
         </Button>
       ) : (
-        <Button type="submit" tone="primary" disabled={sending || !value.trim()}>
+        <Button type="submit" tone="primary" disabled={!enabled || sending || !value.trim()}>
           {sending ? "Sending…" : "Send"}
         </Button>
       )}
