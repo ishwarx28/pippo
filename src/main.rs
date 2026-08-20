@@ -325,9 +325,9 @@ mod tests {
             std::process::id(),
             token().unwrap()
         ));
+        cfg::load_at(root.clone()).unwrap();
         let hello = rpc::Hello::new(&root, &cfg::Config::default()).unwrap();
         let proj = Arc::new(proj::Proj::open(root.clone()).unwrap());
-        cfg::load_at(root.clone()).unwrap();
         let rpc = rpc::Rpc::connect(
             spawned.addr,
             spawned.token.clone(),
@@ -384,9 +384,9 @@ mod tests {
         let turn = sess.open("persist me".into()).unwrap();
         sess.chunk(&turn.call, "partial".into()).unwrap();
         let spawned = Service::spawn().unwrap();
+        cfg::load_at(root.clone()).unwrap();
         let hello = rpc::Hello::new(&root, &cfg::Config::default()).unwrap();
         let proj = Arc::new(proj::Proj::open(root.clone()).unwrap());
-        cfg::load_at(root.clone()).unwrap();
         let rpc = rpc::Rpc::connect(
             spawned.addr,
             spawned.token,

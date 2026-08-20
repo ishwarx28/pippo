@@ -140,6 +140,16 @@ func TestShellDispatchesToRuntimeWithoutJoiningOrchestratorTools(t *testing.T) {
 	if ok, _ := result.Data["ok"].(bool); !ok || result.Data["stdout"] != "done" {
 		t.Fatalf("tool result = %#v", result)
 	}
+	result = execTool(context.Background(), peer, nil, "explorer",
+		callID{Turn: "run-read", Request: "request-read"}, "t_1234abcd", model.Call{
+			ID: "shell-read", Name: "shell", Args: map[string]any{"command": "git status"},
+		})
+	if request = <-requests; request.Role != "explorer" || request.Command != "git status" {
+		t.Fatalf("explorer runtime identity = %#v", request)
+	}
+	if ok, _ := result.Data["ok"].(bool); !ok {
+		t.Fatalf("explorer result = %#v", result)
+	}
 	var spoofed shellArgs
 	if decodeArgs(map[string]any{"command": "pwd", "role": "worker"}, &spoofed) == nil {
 		t.Fatal("model supplied a runtime role")

@@ -3,7 +3,11 @@
 use crate::rule;
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::{collections::BTreeMap, env, fs, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
@@ -199,10 +203,7 @@ pub fn load_at(root: PathBuf) -> Result<Config> {
     config.clamp();
     write_if_changed(&config_path, &config)?;
 
-    let presets: Presets = read_json(&dir.join("presets.json"), Presets::default())?;
-    if !presets.0.contains_key(&config.preset) {
-        anyhow::bail!("active preset {:?} is not defined", config.preset);
-    }
+    preset_at(&root, &config.preset)?;
     read_json(&dir.join("account.json"), Account::default())?;
 
     let rules_path = dir.join("rules.yaml");
@@ -216,6 +217,15 @@ pub fn load_at(root: PathBuf) -> Result<Config> {
     fs::read(&rules_path).with_context(|| format!("read config {}", rules_path.display()))?;
 
     Ok(config)
+}
+
+pub fn preset_at(root: &Path, name: &str) -> Result<Preset> {
+    let presets: Presets = read_json(&root.join("cfg/presets.json"), Presets::default())?;
+    presets
+        .0
+        .get(name)
+        .cloned()
+        .with_context(|| format!("active preset {name:?} is not defined"))
 }
 
 fn read_json<T>(path: &PathBuf, default: T) -> Result<T>

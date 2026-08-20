@@ -200,6 +200,7 @@ type hello struct {
 	Paths    paths           `json:"paths"`
 	Platform platform        `json:"platform"`
 	Settings json.RawMessage `json:"settings"`
+	Preset   json.RawMessage `json:"preset"`
 }
 
 type state struct {
@@ -266,6 +267,7 @@ func (s *state) startup() *hello {
 	}
 	value := *s.hello
 	value.Settings = append(json.RawMessage(nil), s.hello.Settings...)
+	value.Preset = append(json.RawMessage(nil), s.hello.Preset...)
 	return &value
 }
 

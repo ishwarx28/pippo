@@ -152,6 +152,29 @@ var shellTool = model.Tool{
 	},
 }
 
+var planTool = model.Tool{
+	Name:        "plan",
+	Description: "Create an ordered task plan or update one step's progress.",
+	Parameters: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"action":  map[string]any{"type": "string", "enum": []string{"create", "update"}},
+			"task_id": map[string]any{"type": "string"},
+			"goal":    map[string]any{"type": "string"},
+			"steps": map[string]any{"type": "array", "items": map[string]any{
+				"type": "object", "properties": map[string]any{
+					"title": map[string]any{"type": "string"}, "detail": map[string]any{"type": "string"},
+					"files":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+					"verify": map[string]any{"type": "string"}, "risk": map[string]any{"type": "string"},
+				}, "required": []string{"title", "detail", "files", "verify", "risk"}, "additionalProperties": false,
+			}},
+			"step_id": map[string]any{"type": "string"}, "status": map[string]any{"type": "string"},
+			"note": map[string]any{"type": "string"},
+		},
+		"required": []string{"action"}, "additionalProperties": false,
+	},
+}
+
 type taskArgs struct {
 	Action string `json:"action"`
 	Title  string `json:"title,omitempty"`
@@ -187,6 +210,21 @@ type clarifyOption struct {
 type clarifyArgs struct {
 	Question string          `json:"question"`
 	Options  []clarifyOption `json:"options,omitempty"`
+}
+
+type planStep struct {
+	Title, Detail, Verify, Risk string
+	Files                       []string `json:"files"`
+}
+
+type planArgs struct {
+	Action string     `json:"action"`
+	TaskID string     `json:"task_id,omitempty"`
+	Goal   string     `json:"goal,omitempty"`
+	Steps  []planStep `json:"steps,omitempty"`
+	StepID string     `json:"step_id,omitempty"`
+	Status string     `json:"status,omitempty"`
+	Note   string     `json:"note,omitempty"`
 }
 
 type clarifyRequest struct {
@@ -287,6 +325,10 @@ func execTool(
 	call model.Call,
 ) model.Result {
 	result := model.Result{ID: call.ID, Name: call.Name}
+	if !allows(role, call.Name) {
+		result.Data = map[string]any{"error": fmt.Sprintf("tool %s is unavailable to role %s", call.Name, role)}
+		return result
+	}
 	switch call.Name {
 	case taskTool.Name:
 		var args taskArgs
@@ -412,10 +454,37 @@ func execTool(
 		} else {
 			result.Data = output
 		}
+	case planTool.Name:
+		var args planArgs
+		if err := decodeArgs(call.Args, &args); err != nil || checkPlan(args) != nil {
+			result.Data = map[string]any{"error": "invalid plan arguments"}
+		} else {
+			result.Data = map[string]any{"error": "not_ready: plan storage is not available yet"}
+		}
 	default:
 		result.Data = map[string]any{"error": "unknown tool"}
 	}
 	return result
+}
+
+func checkPlan(args planArgs) error {
+	if args.Action == "update" {
+		if args.StepID == "" || args.Status == "" || args.Note == "" || args.TaskID != "" ||
+			args.Goal != "" || len(args.Steps) != 0 {
+			return errors.New("plan update requires step id, status and note")
+		}
+		return nil
+	}
+	if args.Action != "create" || args.TaskID == "" || args.Goal == "" || len(args.Steps) == 0 ||
+		args.StepID != "" || args.Status != "" || args.Note != "" {
+		return errors.New("plan create requires task, goal and steps")
+	}
+	for _, step := range args.Steps {
+		if step.Title == "" || step.Detail == "" || step.Verify == "" || step.Risk == "" {
+			return errors.New("plan step is incomplete")
+		}
+	}
+	return nil
 }
 
 func checkShell(args shellArgs) error {

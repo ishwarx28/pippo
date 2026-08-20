@@ -32,7 +32,7 @@ func (Gemini) Stream(
 	if len(prompt) == 0 && len(tail) == 0 {
 		return errors.New("model request has no live content")
 	}
-	config := &genai.GenerateContentConfig{Tools: tools(request.Tools)}
+	config := generationConfig(request)
 	if len(prefix) != 0 {
 		config.SystemInstruction = &genai.Content{Parts: prefix}
 	}
@@ -64,6 +64,22 @@ func (Gemini) Stream(
 		}
 	}
 	return nil
+}
+
+func generationConfig(request Request) *genai.GenerateContentConfig {
+	config := &genai.GenerateContentConfig{Tools: tools(request.Tools), Temperature: request.Temperature}
+	switch request.Reasoning {
+	case ReasoningOff:
+		zero := int32(0)
+		config.ThinkingConfig = &genai.ThinkingConfig{ThinkingBudget: &zero}
+	case ReasoningLow:
+		config.ThinkingConfig = &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelLow}
+	case ReasoningMedium:
+		config.ThinkingConfig = &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelMedium}
+	case ReasoningHigh:
+		config.ThinkingConfig = &genai.ThinkingConfig{ThinkingLevel: genai.ThinkingLevelHigh}
+	}
+	return config
 }
 
 func tools(input []Tool) []*genai.Tool {

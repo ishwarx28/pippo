@@ -107,6 +107,7 @@ func TestStreamIsCorrelatedAndCancellable(t *testing.T) {
 		Paths:    paths{Runtime: "/runtime", Cache: "/cache", Agent: "/agent"},
 		Platform: platform{OS: "test", Arch: "test"},
 		Settings: settings,
+		Preset:   testPreset(),
 	}, &ready); err != nil {
 		t.Fatal(err)
 	}
@@ -244,7 +245,7 @@ func TestTurnExecutesTaskThroughRuntimeAndContinues(t *testing.T) {
 	}
 	if err := client.call(context.Background(), "hello", hello{
 		Paths:    paths{Runtime: "/runtime", Cache: "/cache", Agent: "/agent"},
-		Platform: platform{OS: "test", Arch: "test"}, Settings: settings,
+		Platform: platform{OS: "test", Arch: "test"}, Settings: settings, Preset: testPreset(),
 	}, &ready); err != nil {
 		t.Fatal(err)
 	}
@@ -332,7 +333,7 @@ func TestTurnWaitsForClarificationAndContinuesWithAnswer(t *testing.T) {
 	}
 	if err := client.call(context.Background(), "hello", hello{
 		Paths:    paths{Runtime: "/runtime", Cache: "/cache", Agent: "/agent"},
-		Platform: platform{OS: "test", Arch: "test"}, Settings: settings,
+		Platform: platform{OS: "test", Arch: "test"}, Settings: settings, Preset: testPreset(),
 	}, &ready); err != nil {
 		t.Fatal(err)
 	}
@@ -364,6 +365,10 @@ func TestTurnWaitsForClarificationAndContinuesWithAnswer(t *testing.T) {
 	if provider.err != nil {
 		t.Fatal(provider.err)
 	}
+}
+
+func testPreset() json.RawMessage {
+	return json.RawMessage(`{"all":{}}`)
 }
 
 type blockingProvider struct {

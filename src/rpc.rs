@@ -1,7 +1,7 @@
 // Owns the websocket connection and concurrent JSON-RPC dispatch.
 
 use crate::{
-    cfg::Config,
+    cfg::{self, Config},
     key::Key,
     proj::{Proj, TaskStatus},
     rule::{self, Decision, Request as RuleRequest},
@@ -54,6 +54,7 @@ pub struct Hello {
     pub paths: Paths,
     pub platform: Platform,
     pub settings: Config,
+    pub preset: cfg::Preset,
 }
 
 impl Hello {
@@ -74,6 +75,7 @@ impl Hello {
                 arch: env::consts::ARCH.into(),
             },
             settings: settings.clone(),
+            preset: cfg::preset_at(root, &settings.preset)?,
         })
     }
 }

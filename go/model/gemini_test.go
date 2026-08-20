@@ -38,3 +38,30 @@ func TestConversationSendsLabeledMediaAsInlineBytes(t *testing.T) {
 		t.Fatalf("media parts = %#v", parts)
 	}
 }
+
+func TestGenerationConfigCarriesTemperatureAndReasoning(t *testing.T) {
+	temperature := float32(0.6)
+	tests := []struct {
+		reasoning Reasoning
+		level     genai.ThinkingLevel
+		off       bool
+	}{
+		{ReasoningOff, "", true},
+		{ReasoningLow, genai.ThinkingLevelLow, false},
+		{ReasoningMedium, genai.ThinkingLevelMedium, false},
+		{ReasoningHigh, genai.ThinkingLevelHigh, false},
+	}
+	for _, test := range tests {
+		config := generationConfig(Request{Reasoning: test.reasoning, Temperature: &temperature})
+		if config.Temperature == nil || *config.Temperature != temperature || config.ThinkingConfig == nil {
+			t.Fatalf("%s config = %#v", test.reasoning, config)
+		}
+		if test.off {
+			if config.ThinkingConfig.ThinkingBudget == nil || *config.ThinkingConfig.ThinkingBudget != 0 {
+				t.Fatalf("off config = %#v", config.ThinkingConfig)
+			}
+		} else if config.ThinkingConfig.ThinkingLevel != test.level {
+			t.Fatalf("%s level = %q", test.reasoning, config.ThinkingConfig.ThinkingLevel)
+		}
+	}
+}

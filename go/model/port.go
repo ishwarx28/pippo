@@ -23,12 +23,23 @@ type Block struct {
 }
 
 type Request struct {
-	Model   string
-	Blocks  []Block
-	Tools   []Tool
-	History []Message
-	Media   []Media
+	Model       string
+	Reasoning   Reasoning
+	Temperature *float32
+	Blocks      []Block
+	Tools       []Tool
+	History     []Message
+	Media       []Media
 }
+
+type Reasoning string
+
+const (
+	ReasoningOff    Reasoning = "off"
+	ReasoningLow    Reasoning = "low"
+	ReasoningMedium Reasoning = "medium"
+	ReasoningHigh   Reasoning = "high"
+)
 
 type Media struct {
 	Label string

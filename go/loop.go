@@ -13,11 +13,6 @@ import (
 	"pippo/go/model"
 )
 
-const (
-	defaultModel = "gemini-3.7-flash"
-	systemPrompt = "You are pippo, a collaborative desktop agent. Register concrete project work with task before delegating it, close it after verified work, and report only what you know."
-)
-
 type prompt struct {
 	SystemPrompt      string
 	ToolDeclarations  string
@@ -64,6 +59,9 @@ type limits struct {
 	MaxBackgroundJobs uint8 `json:"max_background_jobs"`
 	MaxSteps          struct {
 		Orchestrator uint16 `json:"orchestrator"`
+		Planner      uint16 `json:"planner"`
+		Explorer     uint16 `json:"explorer"`
+		Worker       uint16 `json:"worker"`
 	} `json:"max_steps"`
 	MaxDepth uint8 `json:"max_depth"`
 }
@@ -141,32 +139,38 @@ func startTurn(state *state) handler {
 		if startup == nil || state.loop == nil || state.loop.provider == nil {
 			return nil, errors.New("model loop is not ready")
 		}
-		modelName := strings.TrimSpace(input.Model)
-		if modelName == "" {
-			modelName = defaultModel
+		roles, err := resolveRoles(startup)
+		if err != nil {
+			return nil, err
+		}
+		current := roles[orchestratorRole]
+		if modelName := strings.TrimSpace(input.Model); modelName != "" {
+			current.Model = modelName
+			var configured limits
+			if err := json.Unmarshal(startup.Settings, &configured); err != nil {
+				return nil, fmt.Errorf("decode model limits: %w", err)
+			}
+			current.Static = roleEnvironment(startup, current, configured)
+			roles[orchestratorRole] = current
 		}
 		var settings limits
 		if err := json.Unmarshal(startup.Settings, &settings); err != nil {
 			return nil, fmt.Errorf("decode model limits: %w", err)
 		}
 		state.loop.agents.configure(int(settings.MaxParallelRuns), int(settings.MaxDepth))
-		environment, err := staticEnvironment(startup, modelName)
+		state.loop.agents.setRoles(roles)
+		toolText, err := declarations(current.Tools)
 		if err != nil {
 			return nil, err
 		}
-		tools := []model.Tool{taskTool, subagentTool, clarifyTool}
-		toolText, err := declarations(tools)
-		if err != nil {
-			return nil, err
-		}
-		request := assemble(modelName, prompt{
-			SystemPrompt:      systemPrompt,
+		request := assemble(current.Model, prompt{
+			SystemPrompt:      current.Prompt,
 			ToolDeclarations:  toolText,
-			StaticEnvironment: environment,
+			StaticEnvironment: current.Static,
 			Transcript:        input.Transcript,
 			Query:             input.Query,
 		})
-		request.Tools = tools
+		request.Tools, request.Reasoning, request.Temperature = current.Tools, current.Reasoning, current.Temperature
 		media, err := prepareMedia(input.Attachments)
 		if err != nil {
 			return nil, err
@@ -177,7 +181,7 @@ func startTurn(state *state) handler {
 			return nil, errors.New("model request is already running")
 		}
 		state.loop.agents.attach(input.callID, media)
-		go state.loop.stream(runCtx, peer, input.callID, request)
+		go state.loop.stream(runCtx, peer, input.callID, request, current)
 		return accepted{callID: input.callID, Accepted: true}, nil
 	}
 }
@@ -195,7 +199,7 @@ func cancelTurn(state *state) handler {
 	}
 }
 
-func (l *loop) stream(ctx context.Context, peer *rpc, id callID, request model.Request) {
+func (l *loop) stream(ctx context.Context, peer *rpc, id callID, request model.Request, current role) {
 	defer l.finish(id)
 	defer l.agents.release(id)
 	status, detail := "done", ""
@@ -207,7 +211,7 @@ func (l *loop) stream(ctx context.Context, peer *rpc, id callID, request model.R
 	} else if secret.Value == "" {
 		status, detail = "failed", "model key is missing"
 	} else {
-		err := l.run(ctx, peer, secret.Value, &request, id)
+		err := l.run(ctx, peer, secret.Value, &request, id, current)
 		secret.Value = ""
 		if ctx.Err() != nil {
 			status = "cancelled"
@@ -223,15 +227,23 @@ func (l *loop) stream(ctx context.Context, peer *rpc, id callID, request model.R
 	}
 }
 
-func (l *loop) run(ctx context.Context, peer *rpc, key string, request *model.Request, id callID) error {
+func (l *loop) run(ctx context.Context, peer *rpc, key string, request *model.Request, id callID, current role) error {
+	budget := steps{max: current.Steps}
 	for {
+		warn, err := budget.take()
+		if err != nil {
+			return err
+		}
+		if warn {
+			request.History = append(request.History, model.Message{Role: "user", Text: convergeNotice})
+		}
 		if err := refreshLive(ctx, peer, request, "", l.agents); err != nil {
 			return err
 		}
 		var text strings.Builder
 		var calls []model.Call
 		seen := make(map[string]bool)
-		err := l.provider.Stream(ctx, key, *request, func(value model.Chunk) error {
+		err = l.provider.Stream(ctx, key, *request, func(value model.Chunk) error {
 			if value.Text != "" {
 				text.WriteString(value.Text)
 				if err := peer.notify("turn.chunk", chunk{callID: id, Text: value.Text}); err != nil {
@@ -256,11 +268,20 @@ func (l *loop) run(ctx context.Context, peer *rpc, key string, request *model.Re
 		request.History = append(request.History, model.Message{
 			Role: "model", Text: text.String(), Calls: calls,
 		})
+		if !budget.room(len(calls)) {
+			return budget.limit()
+		}
 		results := make([]model.Result, 0, len(calls))
+		warn = false
 		for _, call := range calls {
-			results = append(results, execTool(ctx, peer, l.agents, "orchestrator", id, "", call))
+			crossed, _ := budget.take()
+			warn = warn || crossed
+			results = append(results, execTool(ctx, peer, l.agents, current.Name, id, "", call))
 		}
 		request.History = append(request.History, model.Message{Role: "user", Results: results})
+		if warn {
+			request.History = append(request.History, model.Message{Role: "user", Text: convergeNotice})
+		}
 	}
 }
 
@@ -284,23 +305,4 @@ func assemble(modelName string, input prompt) model.Request {
 		}
 	}
 	return request
-}
-
-func staticEnvironment(startup *hello, modelName string) (string, error) {
-	var settings limits
-	if err := json.Unmarshal(startup.Settings, &settings); err != nil {
-		return "", fmt.Errorf("decode model limits: %w", err)
-	}
-	return fmt.Sprintf(
-		"agent dir: %s\ncache dir: %s\nplatform: %s/%s\nmodel: %s\nmax parallel runs: %d\nmax background jobs: %d\nmax orchestrator steps: %d\nmax depth: %d",
-		startup.Paths.Agent,
-		startup.Paths.Cache,
-		startup.Platform.OS,
-		startup.Platform.Arch,
-		modelName,
-		settings.MaxParallelRuns,
-		settings.MaxBackgroundJobs,
-		settings.MaxSteps.Orchestrator,
-		settings.MaxDepth,
-	), nil
 }

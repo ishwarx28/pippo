@@ -99,6 +99,8 @@ type agentRun struct {
 	active    bool
 	epoch     uint64
 	media     []numberedMedia
+	role      role
+	budget    steps
 }
 
 type runSet struct {
@@ -106,6 +108,7 @@ type runSet struct {
 	provider    model.Provider
 	runs        map[string]*agentRun
 	origins     map[callID][]numberedMedia
+	roles       map[string]role
 	changed     chan struct{}
 	maxParallel int
 	maxDepth    int
@@ -137,6 +140,12 @@ func (s *runSet) release(id callID) {
 func (s *runSet) configure(parallel, depth int) {
 	s.mu.Lock()
 	s.maxParallel, s.maxDepth = parallel, depth
+	s.mu.Unlock()
+}
+
+func (s *runSet) setRoles(roles map[string]role) {
+	s.mu.Lock()
+	s.roles = roles
 	s.mu.Unlock()
 }
 
@@ -218,6 +227,15 @@ func (s *runSet) spawn(
 		s.mu.Unlock()
 		return runOutput{}, errors.New("parallel subagent limit reached")
 	}
+	current := roleDefaults(limits{})[args.Role]
+	if configured, ok := s.roles[args.Role]; ok {
+		current = configured
+	}
+	toolText, err := declarations(current.Tools)
+	if err != nil {
+		s.mu.Unlock()
+		return runOutput{}, fmt.Errorf("declare %s tools: %w", args.Role, err)
+	}
 	var meta runMeta
 	err = peer.call(context.WithoutCancel(ctx), "runtime.run", runCreate{
 		Action: "create", ParentID: parent, TaskID: args.TaskID, Role: args.Role,
@@ -233,10 +251,13 @@ func (s *runSet) spawn(
 		return runOutput{}, errors.New("runtime returned inconsistent run metadata")
 	}
 	run := &agentRun{
-		meta: meta, depth: depth, peer: peer, media: media,
-		request: model.Request{Model: defaultModel,
-			Blocks: []model.Block{{Kind: model.Query, Text: runQuery(meta)}}, Media: visibleMedia(media)},
+		meta: meta, depth: depth, peer: peer, media: media, role: current, budget: steps{max: current.Steps},
+		request: assemble(current.Model, prompt{SystemPrompt: current.Prompt, ToolDeclarations: toolText,
+			StaticEnvironment: current.Static, Query: runQuery(meta)}),
 	}
+	run.request.Tools, run.request.Reasoning, run.request.Temperature =
+		current.Tools, current.Reasoning, current.Temperature
+	run.request.Media = visibleMedia(media)
 	s.next++
 	run.order = s.next
 	s.runs[meta.ID] = run
@@ -329,6 +350,7 @@ func (s *runSet) resume(ctx context.Context, parent string, args subagentArgs) (
 	}
 	if terminal(run.meta.Status) {
 		attempt++
+		run.budget = steps{max: run.role.Steps}
 	}
 	if note := resumeNote(args.Answers, args.Amend); note != "" {
 		history = append(history, model.Message{Role: "user", Text: note})
@@ -432,21 +454,16 @@ func (s *runSet) execute(ctx context.Context, id string, epoch uint64) {
 	defer s.wg.Done()
 	s.mu.Lock()
 	run := s.runs[id]
-	request, peer := run.request, run.peer
+	request, peer, current, budget := run.request, run.peer, run.role, run.budget
+	task, attempt := run.meta.TaskID, run.meta.Attempt
 	s.mu.Unlock()
 	var secret struct {
 		Value string `json:"value"`
 	}
 	err := peer.call(ctx, "runtime.model_key", struct{}{}, &secret)
-	var report strings.Builder
+	report := ""
 	if err == nil {
-		err = s.provider.Stream(ctx, secret.Value, request, func(value model.Chunk) error {
-			if value.Call != nil {
-				return fmt.Errorf("subagent returned undeclared tool %q", value.Call.Name)
-			}
-			report.WriteString(value.Text)
-			return nil
-		})
+		request, report, err = s.run(ctx, peer, secret.Value, id, task, attempt, current, request, &budget)
 	}
 	secret.Value = ""
 	s.mu.Lock()
@@ -455,7 +472,7 @@ func (s *runSet) execute(ctx context.Context, id string, epoch uint64) {
 	if run == nil || run.epoch != epoch {
 		return
 	}
-	run.report = report.String()
+	run.request, run.report, run.budget = request, report, budget
 	run.active, run.cancel = false, nil
 	close(run.settled)
 	if run.meta.Status != runRunning {
@@ -480,6 +497,59 @@ func (s *runSet) execute(ctx context.Context, id string, epoch uint64) {
 	}
 	run.meta.Status = status
 	s.signalLocked()
+}
+
+func (s *runSet) run(
+	ctx context.Context,
+	peer *rpc,
+	key, id, task string,
+	attempt int,
+	current role,
+	request model.Request,
+	budget *steps,
+) (model.Request, string, error) {
+	last := ""
+	callID := callID{Turn: id, Request: fmt.Sprintf("%s_%d", id, attempt)}
+	for {
+		warn, err := budget.take()
+		if err != nil {
+			return request, last, err
+		}
+		if warn {
+			request.History = append(request.History, model.Message{Role: "user", Text: convergeNotice})
+		}
+		if err := refreshLive(ctx, peer, &request, task, s); err != nil {
+			return request, last, err
+		}
+		var text strings.Builder
+		var calls []model.Call
+		err = s.provider.Stream(ctx, key, request, func(value model.Chunk) error {
+			text.WriteString(value.Text)
+			if value.Call != nil {
+				calls = append(calls, *value.Call)
+			}
+			return nil
+		})
+		last = text.String()
+		if err != nil || len(calls) == 0 {
+			return request, last, err
+		}
+		request.History = append(request.History, model.Message{Role: "model", Text: last, Calls: calls})
+		if !budget.room(len(calls)) {
+			return request, last, budget.limit()
+		}
+		results := make([]model.Result, 0, len(calls))
+		warn = false
+		for _, call := range calls {
+			crossed, _ := budget.take()
+			warn = warn || crossed
+			results = append(results, execTool(ctx, peer, s, current.Name, callID, task, call))
+		}
+		request.History = append(request.History, model.Message{Role: "user", Results: results})
+		if warn {
+			request.History = append(request.History, model.Message{Role: "user", Text: convergeNotice})
+		}
+	}
 }
 
 func (s *runSet) interrupt(peer *rpc) {

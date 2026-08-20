@@ -53,6 +53,7 @@ func (p *controlledProvider) Stream(
 type runtimeRuns struct {
 	mu      sync.Mutex
 	next    int
+	finds   int
 	entries map[string]runMeta
 	creates []runCreate
 	reports map[string][]string
@@ -116,6 +117,15 @@ func runHarness(t *testing.T, provider model.Provider) (*runSet, *rpc, *runtimeR
 	client := dialRPCWith(t, server.URL, validToken, map[string]handler{
 		"runtime.model_key": func(context.Context, *rpc, json.RawMessage) (any, error) {
 			return map[string]string{"value": "test-key"}, nil
+		},
+		"runtime.live_env": func(context.Context, *rpc, json.RawMessage) (any, error) {
+			return liveState{Date: "2026-08-20"}, nil
+		},
+		"runtime.find": func(context.Context, *rpc, json.RawMessage) (any, error) {
+			runtime.mu.Lock()
+			runtime.finds++
+			runtime.mu.Unlock()
+			return map[string]any{"ok": true, "kind": "search", "hits": []any{}}, nil
 		},
 		"runtime.run": func(ctx context.Context, peer *rpc, raw json.RawMessage) (any, error) {
 			var action struct {
@@ -229,8 +239,14 @@ func TestSubagentAssemblesPathsWithoutReportContents(t *testing.T) {
 		"- Read only\n- Cite exact lines\n</constraints>\n<reports>\n" +
 		"- [central] projects/pippo_123abc/reports/t_old/old_(1).md\n" +
 		"- projects/pippo_123abc/reports/t_old/latest.md\n</reports>"
-	if len(attempt.request.Blocks) != 1 || attempt.request.Blocks[0].Kind != model.Query ||
-		attempt.request.Blocks[0].Text != want || strings.Contains(attempt.request.Blocks[0].Text, "report body") {
+	if got := []model.BlockKind{attempt.request.Blocks[0].Kind, attempt.request.Blocks[1].Kind,
+		attempt.request.Blocks[2].Kind}; !reflect.DeepEqual(got, []model.BlockKind{
+		model.SystemPrompt, model.ToolDeclarations, model.Query,
+	}) {
+		t.Fatalf("role block order = %#v", attempt.request.Blocks)
+	}
+	query := attempt.request.Blocks[len(attempt.request.Blocks)-2]
+	if query.Kind != model.Query || query.Text != want || strings.Contains(query.Text, "report body") {
 		t.Fatalf("assembled request = %#v", attempt.request.Blocks)
 	}
 	attempt.release <- "done"
