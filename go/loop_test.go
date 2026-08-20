@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -70,6 +71,9 @@ func TestStreamIsCorrelatedAndCancellable(t *testing.T) {
 		},
 		"runtime.model_key": func(context.Context, *rpc, json.RawMessage) (any, error) {
 			return map[string]string{"value": "temporary-test-key"}, nil
+		},
+		"runtime.live_env": func(context.Context, *rpc, json.RawMessage) (any, error) {
+			return liveState{Date: "2026-08-20"}, nil
 		},
 		"turn.chunk": func(_ context.Context, _ *rpc, raw json.RawMessage) (any, error) {
 			var value chunk
@@ -176,12 +180,25 @@ func TestTurnExecutesTaskThroughRuntimeAndContinues(t *testing.T) {
 	tasks := make(chan taskArgs, 1)
 	chunks := make(chan chunk, 1)
 	closedEvents := make(chan closed, 1)
+	var liveCalls atomic.Int32
 	client := dialRPCWith(t, server.URL, validToken, map[string]handler{
 		"runtime.ping": func(context.Context, *rpc, json.RawMessage) (any, error) {
 			return map[string]bool{"ready": true}, nil
 		},
 		"runtime.model_key": func(context.Context, *rpc, json.RawMessage) (any, error) {
 			return map[string]string{"value": "temporary-test-key"}, nil
+		},
+		"runtime.live_env": func(context.Context, *rpc, json.RawMessage) (any, error) {
+			if liveCalls.Add(1) == 1 {
+				return liveState{Date: "2026-08-20"}, nil
+			}
+			return liveState{
+				Date: "2026-08-20",
+				Task: &liveTask{
+					ID: "t_1234abcd", Title: "add upload retry", Status: "running", Active: true,
+				},
+				Project: &liveProject{ID: "pippo_123abc", Name: "pippo", Path: "/work/pippo"},
+			}, nil
 		},
 		"runtime.task": func(_ context.Context, _ *rpc, raw json.RawMessage) (any, error) {
 			var value taskArgs
@@ -272,7 +289,16 @@ func (p *taskProvider) Stream(
 		p.err = errors.New("task tool was not declared")
 		return p.err
 	}
+	if len(request.Blocks) == 0 || request.Blocks[len(request.Blocks)-1].Kind != model.LiveEnvironment {
+		p.err = errors.New("live environment was not placed last")
+		return p.err
+	}
+	live := request.Blocks[len(request.Blocks)-1].Text
 	if p.round == 1 {
+		if !strings.Contains(live, "active task: none") {
+			p.err = errors.New("first model call did not get current empty task state")
+			return p.err
+		}
 		return yield(model.Chunk{Call: &model.Call{
 			ID: "call-1", Name: "task", Args: map[string]any{
 				"action": "create", "title": "add upload retry", "path": "/work/pippo",
@@ -281,6 +307,10 @@ func (p *taskProvider) Stream(
 	}
 	if p.round != 2 || len(request.History) != 2 || len(request.History[1].Results) != 1 {
 		p.err = errors.New("task result was not returned to the model")
+		return p.err
+	}
+	if !strings.Contains(live, "active task: t_1234abcd") || !strings.Contains(live, "project dir: /work/pippo") {
+		p.err = errors.New("second model call did not refresh task state")
 		return p.err
 	}
 	output := request.History[1].Results[0].Data["output"]

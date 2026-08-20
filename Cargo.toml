@@ -8,6 +8,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 anyhow = "1"
+chrono = "0.4"
 futures-util = { version = "0.3.34", features = ["sink"] }
 getrandom = "0.3"
 keyring = "4.1.6"

@@ -209,6 +209,9 @@ func (l *loop) stream(ctx context.Context, peer *rpc, id callID, request model.R
 
 func (l *loop) run(ctx context.Context, peer *rpc, key string, request *model.Request, id callID) error {
 	for {
+		if err := refreshLive(ctx, peer, request, ""); err != nil {
+			return err
+		}
 		var text strings.Builder
 		var calls []model.Call
 		seen := make(map[string]bool)

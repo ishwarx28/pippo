@@ -433,6 +433,7 @@ fn dispatch(
                 }),
             },
             "runtime.task" => task(&shared, input.params),
+            "runtime.live_env" => live(&shared, input.params),
             "turn.chunk" => {
                 send_notice(&shared, order, input.params, |value: Chunk| Notice::Chunk {
                     call: value.call,
@@ -526,6 +527,31 @@ fn task(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Fa
     serde_json::to_value(result).map_err(|error| Failure {
         code: -32603,
         message: format!("encode task result: {error}"),
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveInput {
+    task_id: Option<String>,
+}
+
+fn live(shared: &Shared, params: Option<Value>) -> std::result::Result<Value, Failure> {
+    let input: LiveInput =
+        serde_json::from_value(params.unwrap_or(Value::Null)).map_err(|error| Failure {
+            code: -32602,
+            message: format!("decode live environment request: {error}"),
+        })?;
+    let value = shared
+        .proj
+        .live(input.task_id.as_deref())
+        .map_err(|error| Failure {
+            code: -32603,
+            message: error.to_string(),
+        })?;
+    serde_json::to_value(value).map_err(|error| Failure {
+        code: -32603,
+        message: format!("encode live environment: {error}"),
     })
 }
 
@@ -677,6 +703,15 @@ mod tests {
         .unwrap();
         let id = created["task_id"].as_str().unwrap();
         assert!(id.starts_with("t_") && id.len() == 10);
+        let current = live(&shared, Some(serde_json::json!({}))).unwrap();
+        assert_eq!(current["task"]["id"], id);
+        assert_eq!(
+            current["project"]["path"],
+            std::fs::canonicalize(&work)
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        );
         assert!(task(
             &shared,
             Some(serde_json::json!({

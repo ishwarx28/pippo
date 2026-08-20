@@ -1,12 +1,14 @@
 // Owns project registration and durable task state.
 
 use anyhow::{Context, Result};
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fmt::Write as _,
     fs::{self, File},
     path::{Component, Path, PathBuf},
+    process::Command,
     sync::{Mutex, MutexGuard},
 };
 
@@ -47,6 +49,27 @@ pub struct TaskReply {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Scope {
     root: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct LiveTask {
+    pub id: String,
+    pub title: String,
+    pub status: TaskStatus,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct Live {
+    pub date: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<LiveTask>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<Project>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<Vec<String>>,
+    pub agents: Vec<PathBuf>,
+    pub projects: Vec<Project>,
 }
 
 impl Scope {
@@ -236,6 +259,55 @@ impl Proj {
         })
     }
 
+    pub fn live(&self, task_id: Option<&str>) -> Result<Live> {
+        let (task, project, projects) = {
+            let state = self.lock()?;
+            let selected = match task_id {
+                Some(id) => Some(
+                    state
+                        .meta
+                        .tasks
+                        .get(id)
+                        .with_context(|| format!("task {id} is not registered"))?,
+                ),
+                None => state
+                    .meta
+                    .active_task
+                    .as_ref()
+                    .and_then(|id| state.meta.tasks.get(id)),
+            };
+            let task = selected.map(|task| LiveTask {
+                id: task.id.clone(),
+                title: task.title.clone(),
+                status: task.status,
+                active: state.meta.active_task.as_deref() == Some(task.id.as_str()),
+            });
+            let project = selected
+                .map(|task| {
+                    state
+                        .projects
+                        .get(&task.project_id)
+                        .cloned()
+                        .with_context(|| format!("project {} is not registered", task.project_id))
+                })
+                .transpose()?;
+            let projects = state.projects.values().cloned().collect();
+            (task, project, projects)
+        };
+        let (git, agents) = match project.as_ref() {
+            Some(project) => (git_status(&project.path)?, agents(&project.path)?),
+            None => (None, Vec::new()),
+        };
+        Ok(Live {
+            date: Local::now().format("%Y-%m-%d").to_string(),
+            task,
+            project,
+            git,
+            agents,
+            projects,
+        })
+    }
+
     fn save(&self, meta: &SessionMeta) -> Result<()> {
         atomic_json(&self.root.join("session/meta.json"), meta)
     }
@@ -397,6 +469,84 @@ fn lexical(path: &Path) -> PathBuf {
     clean
 }
 
+fn git_status(path: &Path) -> Result<Option<Vec<String>>> {
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    };
+    if !meta.is_dir() {
+        anyhow::bail!("project path is not a directory: {}", path.display());
+    }
+    let probe = Command::new("git")
+        .args([
+            "-C",
+            path.to_str().context("project path is not valid Unicode")?,
+        ])
+        .args(["rev-parse", "--show-toplevel"])
+        .env("LC_ALL", "C")
+        .output()
+        .with_context(|| format!("inspect git repository at {}", path.display()))?;
+    if !probe.status.success() {
+        let error = String::from_utf8(probe.stderr).context("decode git repository error")?;
+        if error.contains("not a git repository") {
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "inspect git repository at {}: {}",
+            path.display(),
+            error.trim()
+        );
+    }
+    let output = Command::new("git")
+        .args([
+            "-C",
+            path.to_str().context("project path is not valid Unicode")?,
+        ])
+        .args([
+            "status",
+            "--porcelain=v1",
+            "--branch",
+            "--untracked-files=normal",
+        ])
+        .env("LC_ALL", "C")
+        .output()
+        .with_context(|| format!("read git status at {}", path.display()))?;
+    if !output.status.success() {
+        let error = String::from_utf8(output.stderr).context("decode git status error")?;
+        anyhow::bail!("read git status at {}: {}", path.display(), error.trim());
+    }
+    let status = String::from_utf8(output.stdout).context("decode git status")?;
+    Ok(Some(
+        status
+            .replace("\r\n", "\n")
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+    ))
+}
+
+fn agents(path: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs: Vec<_> = path.ancestors().collect();
+    dirs.reverse();
+    let mut found = Vec::new();
+    for dir in dirs {
+        for name in ["AGENTS.md", "CLAUDE.md"] {
+            let candidate = dir.join(name);
+            match fs::metadata(&candidate) {
+                Ok(meta) if meta.is_file() => found.push(candidate),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("inspect agent file {}", candidate.display()));
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +557,20 @@ mod tests {
     fn root() -> PathBuf {
         let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("pippo-proj-{}-{nonce}", std::process::id()))
+    }
+
+    fn git(path: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -578,6 +742,116 @@ mod tests {
             fs::canonicalize(&second_path).unwrap()
         );
         assert_eq!(reopened.scope(Some(&first.task_id)).unwrap(), first_scope);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_environment_refreshes_project_git_and_agent_paths() {
+        let root = root();
+        let zeta = root.join("work/zeta");
+        let repo = root.join("work/alpha");
+        fs::create_dir_all(&zeta).unwrap();
+        fs::create_dir_all(repo.join("nested")).unwrap();
+        fs::write(root.join("AGENTS.md"), "private instruction contents").unwrap();
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        fs::write(repo.join("tracked.txt"), "first\n").unwrap();
+        git(&repo, &["add", "tracked.txt"]);
+        git(&repo, &["commit", "-qm", "initial"]);
+
+        let proj = Proj::open(root.clone()).unwrap();
+        let old = proj.create("work in zeta".into(), zeta).unwrap();
+        proj.update(old.task_id, TaskStatus::Done, "verified".into())
+            .unwrap();
+        let current = proj.create("work in alpha".into(), repo.clone()).unwrap();
+        let clean = proj.live(None).unwrap();
+        assert_eq!(clean.task.as_ref().unwrap().id, current.task_id);
+        assert!(clean.task.as_ref().unwrap().active);
+        assert_eq!(
+            clean.project.as_ref().unwrap().path,
+            fs::canonicalize(&repo).unwrap()
+        );
+        assert_eq!(clean.git.as_ref().unwrap().len(), 1);
+        assert!(clean.git.as_ref().unwrap()[0].starts_with("## "));
+        assert!(
+            clean.date.len() == 10
+                && clean.date.as_bytes()[4] == b'-'
+                && clean.date.as_bytes()[7] == b'-'
+        );
+
+        fs::write(repo.join("tracked.txt"), "changed\n").unwrap();
+        fs::write(repo.join("new.txt"), "new\n").unwrap();
+        fs::write(repo.join("CLAUDE.md"), "more private contents").unwrap();
+        fs::write(repo.join("nested/AGENTS.md"), "not project-wide").unwrap();
+        let dirty = proj.live(None).unwrap();
+        let status = dirty.git.as_ref().unwrap();
+        assert!(status.iter().any(|line| line == " M tracked.txt"));
+        assert!(status.iter().any(|line| line == "?? new.txt"));
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        let local_agents: Vec<_> = dirty
+            .agents
+            .iter()
+            .filter(|path| path.starts_with(&canonical_root))
+            .cloned()
+            .collect();
+        assert_eq!(
+            local_agents,
+            vec![
+                canonical_root.join("AGENTS.md"),
+                fs::canonicalize(&repo).unwrap().join("CLAUDE.md")
+            ]
+        );
+        assert!(!dirty
+            .agents
+            .iter()
+            .any(|path| path.ends_with("nested/AGENTS.md")));
+        let encoded = serde_json::to_string(&dirty).unwrap();
+        assert!(!encoded.contains("private instruction contents"));
+        assert!(dirty
+            .projects
+            .windows(2)
+            .all(|pair| pair[0].id < pair[1].id));
+
+        proj.update(current.task_id.clone(), TaskStatus::Done, "verified".into())
+            .unwrap();
+        let empty = proj.live(None).unwrap();
+        assert!(empty.task.is_none() && empty.project.is_none() && empty.git.is_none());
+        assert!(empty.agents.is_empty());
+        let closed = proj.live(Some(&current.task_id)).unwrap();
+        assert_eq!(closed.task.as_ref().unwrap().status, TaskStatus::Done);
+        assert!(!closed.task.as_ref().unwrap().active);
+        assert!(closed
+            .git
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|line| line == "?? new.txt"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_environment_handles_missing_projects_and_unknown_tasks() {
+        let root = root();
+        let proj = Proj::open(root.clone()).unwrap();
+        let missing = root.join("work/missing/../gone");
+        let task = proj
+            .create("inspect missing project".into(), missing)
+            .unwrap();
+        let first = proj.live(None).unwrap();
+        assert!(first.git.is_none());
+        assert_eq!(first.project.as_ref().unwrap().path, root.join("work/gone"));
+        assert!(proj.live(Some("t_00000000")).is_err());
+        proj.update(
+            task.task_id,
+            TaskStatus::Abandoned,
+            "path disappeared".into(),
+        )
+        .unwrap();
+        let second = proj.live(None).unwrap();
+        assert!(second.task.is_none());
+        assert_eq!(first.projects, second.projects);
         fs::remove_dir_all(root).unwrap();
     }
 }

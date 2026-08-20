@@ -28,16 +28,15 @@ func (Gemini) Stream(
 	if err != nil {
 		return fmt.Errorf("create Gemini client: %w", err)
 	}
-	prefix, live := content(request.Blocks)
-	if len(live) == 0 {
+	prefix, prompt, tail := content(request.Blocks)
+	if len(prompt) == 0 && len(tail) == 0 {
 		return errors.New("model request has no live content")
 	}
 	config := &genai.GenerateContentConfig{Tools: tools(request.Tools)}
 	if len(prefix) != 0 {
 		config.SystemInstruction = &genai.Content{Parts: prefix}
 	}
-	contents := []*genai.Content{genai.NewContentFromParts(live, genai.RoleUser)}
-	contents = append(contents, history(request.History)...)
+	contents := conversation(prompt, request.History, tail)
 	for response, streamErr := range client.Models.GenerateContentStream(
 		ctx,
 		request.Model,
@@ -106,15 +105,34 @@ func history(input []Message) []*genai.Content {
 	return contents
 }
 
-func content(blocks []Block) (prefix, live []*genai.Part) {
+func content(blocks []Block) (prefix, prompt, tail []*genai.Part) {
 	for _, block := range blocks {
 		part := genai.NewPartFromText(block.Text)
 		switch block.Kind {
 		case SystemPrompt, ToolDeclarations, StaticEnvironment, SkillsIndex, Summary, GlobalPreferences:
 			prefix = append(prefix, part)
+		case LiveEnvironment:
+			tail = append(tail, part)
 		default:
-			live = append(live, part)
+			prompt = append(prompt, part)
 		}
 	}
-	return prefix, live
+	return prefix, prompt, tail
+}
+
+func conversation(prompt []*genai.Part, messages []Message, tail []*genai.Part) []*genai.Content {
+	contents := make([]*genai.Content, 0, 1+len(messages))
+	if len(prompt) != 0 {
+		contents = append(contents, genai.NewContentFromParts(prompt, genai.RoleUser))
+	}
+	contents = append(contents, history(messages)...)
+	if len(tail) == 0 {
+		return contents
+	}
+	if len(contents) != 0 && contents[len(contents)-1].Role == genai.RoleUser {
+		last := contents[len(contents)-1]
+		last.Parts = append(last.Parts, tail...)
+		return contents
+	}
+	return append(contents, genai.NewContentFromParts(tail, genai.RoleUser))
 }
