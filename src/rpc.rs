@@ -1,6 +1,6 @@
 // Owns the websocket connection and concurrent JSON-RPC dispatch.
 
-use crate::cfg::Config;
+use crate::{cfg::Config, key::Key};
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -101,6 +101,7 @@ type Answer = std::result::Result<Value, String>;
 
 struct Shared {
     waits: Mutex<HashMap<u64, mpsc::SyncSender<Answer>>>,
+    key: Key,
 }
 
 struct Inner {
@@ -116,8 +117,8 @@ pub struct Rpc {
 }
 
 impl Rpc {
-    pub fn connect(addr: SocketAddr, token: String, hello: &Hello) -> Result<Self> {
-        let rpc = Self::open(addr, token)?;
+    pub fn connect(addr: SocketAddr, token: String, hello: &Hello, key: Key) -> Result<Self> {
+        let rpc = Self::open(addr, token, key)?;
         let ready: Ready = rpc.call("hello", hello)?;
         if !ready.ready {
             anyhow::bail!("child process did not accept startup hello");
@@ -125,9 +126,10 @@ impl Rpc {
         Ok(rpc)
     }
 
-    fn open(addr: SocketAddr, token: String) -> Result<Self> {
+    fn open(addr: SocketAddr, token: String, key: Key) -> Result<Self> {
         let shared = Arc::new(Shared {
             waits: Mutex::new(HashMap::new()),
+            key,
         });
         let (send, receive) = async_mpsc::unbounded_channel();
         let (started, status) = mpsc::sync_channel(1);
@@ -328,6 +330,17 @@ fn dispatch(shared: Arc<Shared>, output: async_mpsc::UnboundedSender<Command>, b
         let id = input.id;
         let result = match method.as_str() {
             "runtime.ping" => Ok(serde_json::json!({"ready": true})),
+            "runtime.model_key" => match shared.key.read() {
+                Ok(Some(secret)) => Ok(serde_json::json!({"value": secret.expose()})),
+                Ok(None) => Err(Failure {
+                    code: -32001,
+                    message: "model key is missing".into(),
+                }),
+                Err(error) => Err(Failure {
+                    code: -32603,
+                    message: error.to_string(),
+                }),
+            },
             _ => Err(Failure {
                 code: -32601,
                 message: "method not found".into(),

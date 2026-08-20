@@ -128,10 +128,16 @@ fn run() -> Result<()> {
     let cfg = cfg::load_at(root.clone())?;
     let store = store::Store::open(root.clone())?;
     let spawned = Service::spawn()?;
-    let rpc = rpc::Rpc::connect(spawned.addr, spawned.token, &rpc::Hello::new(&root, &cfg)?)?;
+    let key = key::Key;
+    let rpc = rpc::Rpc::connect(
+        spawned.addr,
+        spawned.token,
+        &rpc::Hello::new(&root, &cfg)?,
+        key,
+    )?;
     tauri::Builder::default()
         .manage(cfg)
-        .manage(key::Key)
+        .manage(key)
         .manage(store)
         .manage(rpc)
         .manage(spawned.service)
@@ -163,8 +169,8 @@ mod tests {
         let spawned = Service::spawn().unwrap();
         assert_eq!(spawned.addr.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
         let hello = rpc::Hello::new(&std::env::temp_dir(), &cfg::Config::default()).unwrap();
-        let rpc = rpc::Rpc::connect(spawned.addr, spawned.token.clone(), &hello).unwrap();
-        assert!(rpc::Rpc::connect(spawned.addr, spawned.token, &hello).is_err());
+        let rpc = rpc::Rpc::connect(spawned.addr, spawned.token.clone(), &hello, key::Key).unwrap();
+        assert!(rpc::Rpc::connect(spawned.addr, spawned.token, &hello, key::Key).is_err());
 
         thread::scope(|scope| {
             let calls: Vec<_> = (0..16)

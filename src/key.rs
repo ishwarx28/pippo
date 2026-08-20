@@ -9,6 +9,7 @@ const SERVICE: &str = "app.pippo.desktop";
 const USER: &str = "gemini-api-key";
 const EVENT: &str = "model-key-status";
 
+#[derive(Clone, Copy)]
 pub struct Key;
 
 pub struct Secret(String);

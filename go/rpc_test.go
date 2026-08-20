@@ -83,6 +83,14 @@ func TestRPCHandlesConcurrentCallsBothWays(t *testing.T) {
 }
 
 func dialRPC(t *testing.T, address, token string) *rpc {
+	return dialRPCWith(t, address, token, map[string]handler{
+		"runtime.ping": func(context.Context, *rpc, json.RawMessage) (any, error) {
+			return map[string]bool{"ready": true}, nil
+		},
+	})
+}
+
+func dialRPCWith(t *testing.T, address, token string, handlers map[string]handler) *rpc {
 	t.Helper()
 	header := http.Header{"Authorization": []string{"Bearer " + token}}
 	conn, response, err := websocket.DefaultDialer.Dial(wsURL(address), header)
@@ -94,11 +102,7 @@ func dialRPC(t *testing.T, address, token string) *rpc {
 		}
 		t.Fatal(err)
 	}
-	client := newRPC(conn, map[string]handler{
-		"runtime.ping": func(context.Context, *rpc, json.RawMessage) (any, error) {
-			return map[string]bool{"ready": true}, nil
-		},
-	})
+	client := newRPC(conn, handlers)
 	go client.serve(context.Background())
 	return client
 }

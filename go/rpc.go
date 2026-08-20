@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 
 	"github.com/gorilla/websocket"
+	"pippo/go/model"
 )
 
 const maxMessage = 1 << 20
@@ -134,6 +135,14 @@ func (r *rpc) call(ctx context.Context, method string, params, result any) error
 	}
 }
 
+func (r *rpc) notify(method string, params any) error {
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return fmt.Errorf("encode %s parameters: %w", method, err)
+	}
+	return r.send(message{JSONRPC: "2.0", Method: method, Params: raw})
+}
+
 func (r *rpc) respond(id uint64, result any, failure *rpcError) {
 	var raw json.RawMessage
 	if failure == nil {
@@ -193,6 +202,7 @@ type state struct {
 	mu    sync.RWMutex
 	hello *hello
 	peer  *rpc
+	loop  *loop
 }
 
 func (s *state) attach(peer *rpc) {
@@ -239,7 +249,7 @@ func (s *state) startup() *hello {
 }
 
 func server(guard *auth) *http.Server {
-	return &http.Server{Handler: routes(guard, &state{})}
+	return &http.Server{Handler: routes(guard, &state{loop: newLoop(model.Gemini{})})}
 }
 
 func routes(guard *auth, state *state) http.Handler {
@@ -296,5 +306,7 @@ func handlers(state *state) map[string]handler {
 		"health": func(_ context.Context, _ *rpc, _ json.RawMessage) (any, error) {
 			return map[string]bool{"ready": state.ready()}, nil
 		},
+		"turn.start":  startTurn(state),
+		"turn.cancel": cancelTurn(state),
 	}
 }
