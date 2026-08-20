@@ -919,11 +919,16 @@ fn gate(
     request: RuleRequest<'_>,
     key: ApprovalKey,
 ) -> std::result::Result<(), GateFailure> {
+    let outside = !request.path.starts_with(request.project);
     let ask = match shared.rules.decide(request) {
         Decision::Allow => return Ok(()),
         Decision::Deny(message) => {
             return Err(GateFailure {
-                reason: find::Reason::Denied,
+                reason: if message.contains("unavailable") {
+                    find::Reason::Busy
+                } else {
+                    find::Reason::Denied
+                },
                 message,
             })
         }
@@ -954,14 +959,18 @@ fn gate(
     if let Err(error) = emit_interaction(shared, Interaction::ApprovalOpened { prompt }) {
         let _ = resolve_approval(shared, &id, Err(error.clone()));
         return Err(GateFailure {
-            reason: find::Reason::Denied,
+            reason: find::Reason::Busy,
             message: error,
         });
     }
     match received.recv() {
         Ok(Ok(ApprovalChoice::AllowOnce | ApprovalChoice::AllowSession)) => Ok(()),
         Ok(Ok(ApprovalChoice::Deny)) | Ok(Err(_)) | Err(_) => Err(GateFailure {
-            reason: find::Reason::Denied,
+            reason: if outside {
+                find::Reason::OutsideScope
+            } else {
+                find::Reason::Denied
+            },
             message: "Approval denied".into(),
         }),
     }

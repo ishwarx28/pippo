@@ -23,6 +23,15 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
+type remoteError struct {
+	method string
+	*rpcError
+}
+
+func (e *remoteError) Error() string {
+	return fmt.Sprintf("%s: %s (%d)", e.method, e.Message, e.Code)
+}
+
 type message struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      *uint64         `json:"id,omitempty"`
@@ -122,7 +131,7 @@ func (r *rpc) call(ctx context.Context, method string, params, result any) error
 	select {
 	case output := <-wait:
 		if output.Error != nil {
-			return fmt.Errorf("%s: %s (%d)", method, output.Error.Message, output.Error.Code)
+			return &remoteError{method: method, rpcError: output.Error}
 		}
 		if result != nil && len(output.Result) != 0 {
 			if err := json.Unmarshal(output.Result, result); err != nil {

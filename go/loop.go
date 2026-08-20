@@ -276,7 +276,11 @@ func (l *loop) run(ctx context.Context, peer *rpc, key string, request *model.Re
 		for _, call := range calls {
 			crossed, _ := budget.take()
 			warn = warn || crossed
-			results = append(results, execTool(ctx, peer, l.agents, current.Name, id, "", call))
+			result := execTool(ctx, peer, l.agents, current.Name, id, "", call)
+			if result.Err != nil {
+				return result.Err
+			}
+			results = append(results, result)
 		}
 		request.History = append(request.History, model.Message{Role: "user", Results: results})
 		if warn {

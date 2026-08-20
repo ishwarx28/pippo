@@ -173,7 +173,7 @@ fn write_waits_before_side_effect_and_session_allow_is_exact() {
     resolve_approval(&harness.shared, &prompt.id, Ok(ApprovalChoice::Deny)).unwrap();
     harness.closed(&prompt.id);
     let result = running.join().unwrap();
-    assert_eq!(result["error"]["reason"], "denied");
+    assert_eq!(result["error"]["reason"], "outside_scope");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\n");
 }
 
@@ -238,6 +238,6 @@ fn disconnect_unblocks_an_approval_without_a_side_effect() {
     let prompt = harness.prompt();
     close_shared(&harness.shared, "connection lost");
     harness.closed(&prompt.id);
-    assert_eq!(running.join().unwrap()["error"]["reason"], "denied");
+    assert_eq!(running.join().unwrap()["error"]["reason"], "outside_scope");
     assert!(!path.exists());
 }

@@ -68,6 +68,7 @@ type Result struct {
 	ID   string
 	Name string
 	Data map[string]any
+	Err  error
 }
 
 type Message struct {

@@ -129,6 +129,7 @@ pub enum Reason {
     Limit,
     Busy,
     Timeout,
+    OutsideScope,
 }
 
 pub struct Outcome {

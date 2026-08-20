@@ -326,34 +326,30 @@ func execTool(
 ) model.Result {
 	result := model.Result{ID: call.ID, Name: call.Name}
 	if !allows(role, call.Name) {
-		result.Data = map[string]any{"error": fmt.Sprintf("tool %s is unavailable to role %s", call.Name, role)}
+		failTool(&result, "denied", fmt.Sprintf("tool %s is unavailable to role %s", call.Name, role))
 		return result
 	}
 	switch call.Name {
 	case taskTool.Name:
 		var args taskArgs
 		if err := decodeArgs(call.Args, &args); err != nil {
-			result.Data = map[string]any{"error": "invalid task arguments"}
+			failTool(&result, "bad_args", "invalid task arguments")
 			return result
 		}
 		if err := checkTask(args); err != nil {
-			result.Data = map[string]any{"error": err.Error()}
+			failTool(&result, "bad_args", err.Error())
 			return result
 		}
 		var output map[string]any
-		if err := peer.call(ctx, "runtime.task", args, &output); err != nil {
-			result.Data = map[string]any{"error": err.Error()}
-		} else {
-			result.Data = map[string]any{"output": output}
-		}
+		rpcTool(&result, peer.call(ctx, "runtime.task", args, &output), map[string]any{"output": output})
 	case subagentTool.Name:
 		var args subagentArgs
 		if err := decodeArgs(call.Args, &args); err != nil || checkSubagent(args) != nil {
-			result.Data = map[string]any{"error": "invalid subagent arguments"}
+			failTool(&result, "bad_args", "invalid subagent arguments")
 			return result
 		}
 		if agents == nil {
-			result.Data = map[string]any{"error": "subagent lifecycle is unavailable"}
+			failTool(&result, "busy", "subagent lifecycle is unavailable")
 			return result
 		}
 		args.origin = id
@@ -363,18 +359,18 @@ func execTool(
 		}
 		output, err := agents.act(ctx, peer, role, caller, taskID, args)
 		if err != nil {
-			result.Data = map[string]any{"error": err.Error()}
+			localTool(&result, err)
 		} else {
 			result.Data = map[string]any{"output": output}
 		}
 	case clarifyTool.Name:
 		var args clarifyArgs
 		if err := decodeArgs(call.Args, &args); err != nil {
-			result.Data = map[string]any{"error": "invalid clarify arguments"}
+			failTool(&result, "bad_args", "invalid clarify arguments")
 			return result
 		}
 		if err := checkClarify(args); err != nil {
-			result.Data = map[string]any{"error": err.Error()}
+			failTool(&result, "bad_args", err.Error())
 			return result
 		}
 		input := clarifyRequest{callID: id, CallID: call.ID, clarifyArgs: args}
@@ -385,30 +381,26 @@ func execTool(
 			if ctx.Err() != nil {
 				_ = peer.notify("runtime.clarify.cancel", input)
 			}
-			result.Data = map[string]any{"error": err.Error()}
+			rpcTool(&result, err, nil)
 		} else {
 			result.Data = map[string]any{"answer": output.Answer}
 		}
 	case findTool.Name:
 		var args findArgs
 		if err := decodeArgs(call.Args, &args); err != nil {
-			result.Data = map[string]any{"error": "invalid find arguments"}
+			failTool(&result, "bad_args", "invalid find arguments")
 			return result
 		}
 		if err := checkFind(args); err != nil {
-			result.Data = map[string]any{"error": err.Error()}
+			failTool(&result, "bad_args", err.Error())
 			return result
 		}
-		var output map[string]any
-		if err := peer.call(ctx, "runtime.find", findRequest{callID: id, TaskID: taskID, findArgs: args}, &output); err != nil {
-			result.Data = map[string]any{"error": err.Error()}
-		} else {
-			result.Data = output
-		}
+		output, err := callFind(ctx, peer, findRequest{callID: id, TaskID: taskID, findArgs: args})
+		rpcTool(&result, err, output)
 	case writeTool.Name:
 		var args writeArgs
 		if err := decodeArgs(call.Args, &args); err != nil || checkWrite(args) != nil {
-			result.Data = map[string]any{"error": "write requires path and content"}
+			failTool(&result, "bad_args", "write requires path and content")
 			return result
 		}
 		var output map[string]any
@@ -417,14 +409,14 @@ func execTool(
 			if ctx.Err() != nil {
 				_ = peer.notify("runtime.approval.cancel", shellCancel{callID: id, CallID: call.ID})
 			}
-			result.Data = map[string]any{"error": err.Error()}
+			rpcTool(&result, err, nil)
 		} else {
 			result.Data = output
 		}
 	case editTool.Name:
 		var args editArgs
 		if err := decodeArgs(call.Args, &args); err != nil || checkEdit(args) != nil {
-			result.Data = map[string]any{"error": "edit requires path, target and replacement"}
+			failTool(&result, "bad_args", "edit requires path, target and replacement")
 			return result
 		}
 		var output map[string]any
@@ -433,14 +425,14 @@ func execTool(
 			if ctx.Err() != nil {
 				_ = peer.notify("runtime.approval.cancel", shellCancel{callID: id, CallID: call.ID})
 			}
-			result.Data = map[string]any{"error": err.Error()}
+			rpcTool(&result, err, nil)
 		} else {
 			result.Data = output
 		}
 	case shellTool.Name:
 		var args shellArgs
 		if err := decodeArgs(call.Args, &args); err != nil || checkShell(args) != nil {
-			result.Data = map[string]any{"error": "invalid shell arguments"}
+			failTool(&result, "bad_args", "invalid shell arguments")
 			return result
 		}
 		input := shellRequest{callID: id, CallID: call.ID, TaskID: taskID, Role: role, shellArgs: args}
@@ -450,21 +442,130 @@ func execTool(
 				_ = peer.notify("runtime.shell.cancel", shellCancel{callID: id, CallID: call.ID})
 				_ = peer.notify("runtime.approval.cancel", shellCancel{callID: id, CallID: call.ID})
 			}
-			result.Data = map[string]any{"error": err.Error()}
+			rpcTool(&result, err, nil)
 		} else {
 			result.Data = output
 		}
 	case planTool.Name:
 		var args planArgs
 		if err := decodeArgs(call.Args, &args); err != nil || checkPlan(args) != nil {
-			result.Data = map[string]any{"error": "invalid plan arguments"}
+			failTool(&result, "bad_args", "invalid plan arguments")
 		} else {
-			result.Data = map[string]any{"error": "not_ready: plan storage is not available yet"}
+			failTool(&result, "busy", "plan storage is not available yet")
 		}
 	default:
-		result.Data = map[string]any{"error": "unknown tool"}
+		failTool(&result, "bad_args", "unknown tool")
 	}
 	return result
+}
+
+func failTool(result *model.Result, reason, message string) {
+	result.Data = map[string]any{"ok": false, "error": map[string]any{"reason": reason, "message": message}}
+}
+
+type toolIssue struct {
+	reason, message string
+	fields          map[string]any
+}
+
+func (e *toolIssue) Error() string { return e.message }
+
+func issue(reason, message string, fields ...map[string]any) error {
+	value := &toolIssue{reason: reason, message: message}
+	if len(fields) != 0 {
+		value.fields = fields[0]
+	}
+	return value
+}
+
+func rpcTool(result *model.Result, err error, success map[string]any) {
+	if err == nil {
+		result.Data = success
+		return
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		result.Err = err
+		return
+	}
+	var remote *remoteError
+	if errors.As(err, &remote) {
+		remoteTool(result, remote)
+		return
+	}
+	result.Err = err
+}
+
+func localTool(result *model.Result, err error) {
+	var remote *remoteError
+	var typed *toolIssue
+	message := err.Error()
+	if errors.As(err, &typed) {
+		failTool(result, typed.reason, typed.message)
+		failure := result.Data["error"].(map[string]any)
+		for key, value := range typed.fields {
+			failure[key] = value
+		}
+	} else if errors.As(err, &remote) {
+		remoteTool(result, remote)
+	} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		strings.Contains(message, " rpc") || strings.Contains(message, "connection") ||
+		strings.Contains(message, "runtime returned inconsistent") || strings.Contains(message, "declare ") {
+		result.Err = err
+	} else {
+		failTool(result, toolReason(message), message)
+	}
+}
+
+func remoteTool(result *model.Result, remote *remoteError) {
+	reason := toolReason(remote.Message)
+	if reason == "bad_args" && remote.Code != -32602 {
+		reason = "busy"
+	}
+	failTool(result, reason, remote.Message)
+}
+
+func toolReason(message string) string {
+	message = strings.ToLower(message)
+	switch {
+	case strings.Contains(message, "outside scope"):
+		return "outside_scope"
+	case strings.Contains(message, "denied") || strings.Contains(message, "cannot") || strings.Contains(message, "cancel"):
+		return "denied"
+	case strings.Contains(message, "not found") || strings.Contains(message, "not registered") ||
+		strings.Contains(message, "not owned") || strings.Contains(message, "not active") || strings.Contains(message, "missing"):
+		return "not_found"
+	case strings.Contains(message, "timeout") || strings.Contains(message, "timed out"):
+		return "timeout"
+	case strings.Contains(message, "limit"):
+		return "limit"
+	case strings.Contains(message, "active") || strings.Contains(message, "running") || strings.Contains(message, "settling") ||
+		strings.Contains(message, "stopping") || strings.Contains(message, "busy") || strings.Contains(message, "lock") ||
+		strings.Contains(message, "sheet") || strings.Contains(message, "unavailable"):
+		return "busy"
+	default:
+		return "bad_args"
+	}
+}
+
+func callFind(ctx context.Context, peer *rpc, input findRequest) (map[string]any, error) {
+	var output map[string]any
+	err := peer.call(ctx, "runtime.find", input, &output)
+	if err != nil || input.Path == "" || !busyResult(output) {
+		return output, err
+	}
+	output = nil
+	err = peer.call(ctx, "runtime.find", input, &output)
+	if output != nil {
+		output["attempts"] = 2
+	}
+	return output, err
+}
+
+func busyResult(output map[string]any) bool {
+	failure, _ := output["error"].(map[string]any)
+	reason, _ := failure["reason"].(string)
+	message, _ := failure["message"].(string)
+	return reason == "busy" && !strings.Contains(strings.ToLower(message), "lock")
 }
 
 func checkPlan(args planArgs) error {

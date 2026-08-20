@@ -112,7 +112,7 @@ func TestRoleDispatchDeniesUndeclaredToolsBeforeRPC(t *testing.T) {
 		result := execTool(t.Context(), nil, nil, test.role, callID{}, "", model.Call{
 			ID: "wrong-role", Name: test.tool,
 		})
-		if !strings.Contains(result.Data["error"].(string), "unavailable") {
+		if failureReason(result) != "denied" {
 			t.Fatalf("%s/%s result = %#v", test.role, test.tool, result)
 		}
 	}
@@ -125,7 +125,7 @@ func TestRoleDispatchDeniesUndeclaredToolsBeforeRPC(t *testing.T) {
 			}},
 		},
 	})
-	if !strings.Contains(result.Data["error"].(string), "not_ready") {
+	if failureReason(result) != "busy" {
 		t.Fatalf("plan result = %#v", result)
 	}
 }

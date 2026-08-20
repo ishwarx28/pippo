@@ -161,7 +161,7 @@ func (s *runSet) act(
 	args subagentArgs,
 ) (any, error) {
 	if callerRole != "orchestrator" && callerRole != "planner" {
-		return nil, errors.New("this role cannot control subagents")
+		return nil, issue("denied", "this role cannot control subagents")
 	}
 	parent := ""
 	if callerRole == "planner" {
@@ -198,18 +198,22 @@ func (s *runSet) spawn(
 	s.mu.Lock()
 	if s.stopping {
 		s.mu.Unlock()
-		return runOutput{}, errors.New("subagents are stopping")
+		return runOutput{}, issue("busy", "subagents are stopping")
 	}
 	depth := 1
 	if parent != "" {
 		owner := s.runs[parent]
-		if owner == nil || owner.meta.Status != runRunning || owner.meta.Role != "planner" {
+		if owner == nil {
 			s.mu.Unlock()
-			return runOutput{}, errors.New("parent planner run is not active")
+			return runOutput{}, issue("not_found", "parent planner run was not found")
+		}
+		if owner.meta.Status != runRunning || owner.meta.Role != "planner" {
+			s.mu.Unlock()
+			return runOutput{}, issue("busy", "parent planner run is not active", map[string]any{"status": owner.meta.Status})
 		}
 		if owner.meta.TaskID != args.TaskID || args.TaskID != taskID {
 			s.mu.Unlock()
-			return runOutput{}, errors.New("child run must reuse its parent's task")
+			return runOutput{}, issue("denied", "child run must reuse its parent's task")
 		}
 		depth = owner.depth + 1
 	}
@@ -224,11 +228,11 @@ func (s *runSet) spawn(
 	}
 	if depth > s.maxDepth {
 		s.mu.Unlock()
-		return runOutput{}, errors.New("subagent nesting limit reached")
+		return runOutput{}, issue("limit", "subagent nesting limit reached")
 	}
 	if s.activeLocked() >= s.maxParallel {
 		s.mu.Unlock()
-		return runOutput{}, errors.New("parallel subagent limit reached")
+		return runOutput{}, issue("limit", "parallel subagent limit reached")
 	}
 	current := roleDefaults(limits{})[args.Role]
 	if configured, ok := s.roles[args.Role]; ok {
@@ -300,8 +304,9 @@ func (s *runSet) pause(ctx context.Context, parent, id string) (runOutput, error
 		return result, nil
 	}
 	if run.meta.Status != runRunning {
+		status := run.meta.Status
 		s.mu.Unlock()
-		return runOutput{}, fmt.Errorf("run %s is not running", id)
+		return runOutput{}, issue("busy", fmt.Sprintf("run %s is not running", id), map[string]any{"status": status})
 	}
 	if _, err := s.persistLocked(ctx, run, runPaused, run.meta.Attempt, ""); err != nil {
 		s.mu.Unlock()
@@ -335,12 +340,13 @@ func (s *runSet) resume(ctx context.Context, parent string, args subagentArgs) (
 		return runOutput{}, err
 	}
 	if run.active {
+		status := run.meta.Status
 		s.mu.Unlock()
-		return runOutput{}, fmt.Errorf("run %s is still settling", args.ID)
+		return runOutput{}, issue("busy", fmt.Sprintf("run %s is still settling", args.ID), map[string]any{"status": status})
 	}
 	if run.meta.Status == runRunning {
 		s.mu.Unlock()
-		return runOutput{}, fmt.Errorf("run %s is already running", args.ID)
+		return runOutput{}, issue("busy", fmt.Sprintf("run %s is already running", args.ID), map[string]any{"status": runRunning})
 	}
 	blocked := run.meta.Status == runBlocked
 	if blocked {
@@ -350,11 +356,11 @@ func (s *runSet) resume(ctx context.Context, parent string, args subagentArgs) (
 		}
 	} else if len(args.Answers) != 0 {
 		s.mu.Unlock()
-		return runOutput{}, errors.New("answers are only accepted for a blocked run")
+		return runOutput{}, issue("bad_args", "answers are only accepted for a blocked run")
 	}
 	if s.activeLocked() >= s.maxParallel {
 		s.mu.Unlock()
-		return runOutput{}, errors.New("parallel subagent limit reached")
+		return runOutput{}, issue("limit", "parallel subagent limit reached")
 	}
 	restart := blocked || terminal(run.meta.Status)
 	attempt := run.meta.Attempt
@@ -436,7 +442,7 @@ func (s *runSet) wait(ctx context.Context, parent string, ids []string) ([]runOu
 		for _, id := range ids {
 			if seen[id] {
 				s.mu.Unlock()
-				return nil, fmt.Errorf("run %s was repeated", id)
+				return nil, issue("bad_args", fmt.Sprintf("run %s was repeated", id))
 			}
 			seen[id] = true
 			run, err := s.ownedLocked(parent, id)
@@ -553,10 +559,18 @@ func (s *runSet) run(
 		}
 		var text strings.Builder
 		var calls []model.Call
+		seen := make(map[string]bool)
 		err = s.provider.Stream(ctx, key, request, func(value model.Chunk) error {
 			text.WriteString(value.Text)
 			if value.Call != nil {
-				calls = append(calls, *value.Call)
+				identity, encode := json.Marshal(value.Call)
+				if encode != nil {
+					return fmt.Errorf("encode tool call: %w", encode)
+				}
+				if !seen[string(identity)] {
+					seen[string(identity)] = true
+					calls = append(calls, *value.Call)
+				}
 			}
 			return nil
 		})
@@ -573,7 +587,11 @@ func (s *runSet) run(
 		for _, call := range calls {
 			crossed, _ := budget.take()
 			warn = warn || crossed
-			results = append(results, execTool(ctx, peer, s, current.Name, callID, task, call))
+			result := execTool(ctx, peer, s, current.Name, callID, task, call)
+			if result.Err != nil {
+				return request, last, result.Err
+			}
+			results = append(results, result)
 		}
 		request.History = append(request.History, model.Message{Role: "user", Results: results})
 		if warn {
@@ -634,7 +652,7 @@ func (s *runSet) persistLocked(
 func (s *runSet) ownedLocked(parent, id string) (*agentRun, error) {
 	run := s.runs[id]
 	if run == nil || run.meta.ParentID != parent {
-		return nil, fmt.Errorf("run %s is not owned by this caller", id)
+		return nil, issue("not_found", fmt.Sprintf("run %s is not owned by this caller", id))
 	}
 	return run, nil
 }

@@ -4,9 +4,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"pippo/go/model"
@@ -227,9 +229,15 @@ func TestShellCancellationNotifiesTheRuntime(t *testing.T) {
 	if approval != input {
 		t.Fatalf("approval cancellation = %#v", approval)
 	}
-	if !strings.Contains(result.Data["error"].(string), "context canceled") {
+	if !errors.Is(result.Err, context.Canceled) {
 		t.Fatalf("cancelled result = %#v", result)
 	}
+}
+
+func failureReason(result model.Result) string {
+	failure, _ := result.Data["error"].(map[string]any)
+	reason, _ := failure["reason"].(string)
+	return reason
 }
 
 func TestFindDispatchesToRuntimeWithoutJoiningOrchestratorTools(t *testing.T) {
@@ -318,5 +326,197 @@ func TestFindDispatchesToRuntimeWithoutJoiningOrchestratorTools(t *testing.T) {
 	}
 	if ok, _ := result.Data["ok"].(bool); !ok {
 		t.Fatalf("edit result = %#v", result)
+	}
+}
+
+func TestEveryToolValidationFailureUsesOneTypedShape(t *testing.T) {
+	tests := []struct {
+		role, reason string
+		call         model.Call
+	}{
+		{orchestratorRole, "bad_args", model.Call{ID: "task", Name: "task", Args: map[string]any{}}},
+		{orchestratorRole, "busy", model.Call{ID: "subagent", Name: "subagent", Args: map[string]any{
+			"action": "spawn", "role": "explorer", "title": "find project", "request": "Find it.",
+		}}},
+		{orchestratorRole, "bad_args", model.Call{ID: "clarify", Name: "clarify", Args: map[string]any{
+			"question": "two\nquestions",
+		}}},
+		{workerRole, "bad_args", model.Call{ID: "find", Name: "find", Args: map[string]any{}}},
+		{workerRole, "bad_args", model.Call{ID: "write", Name: "write", Args: map[string]any{}}},
+		{workerRole, "bad_args", model.Call{ID: "edit", Name: "edit", Args: map[string]any{}}},
+		{workerRole, "bad_args", model.Call{ID: "shell", Name: "shell", Args: map[string]any{}}},
+		{plannerRole, "busy", model.Call{ID: "plan", Name: "plan", Args: map[string]any{
+			"action": "create", "task_id": "task", "goal": "goal", "steps": []any{map[string]any{
+				"title": "one", "detail": "detail", "files": []any{"a"}, "verify": "test", "risk": "none",
+			}},
+		}}},
+	}
+	for _, test := range tests {
+		result := execTool(t.Context(), nil, nil, test.role, callID{}, "", test.call)
+		failure, ok := result.Data["error"].(map[string]any)
+		if result.Err != nil || result.Data["ok"] != false || !ok || failureReason(result) != test.reason ||
+			strings.TrimSpace(failure["message"].(string)) == "" {
+			t.Fatalf("%s result = %#v", test.call.Name, result)
+		}
+	}
+	for message, reason := range map[string]string{
+		"path outside scope": "outside_scope", "approval denied": "denied",
+		"run not found": "not_found", "command timed out": "timeout",
+		"parallel limit reached": "limit", "run is active": "busy", "invalid shape": "bad_args",
+	} {
+		if got := toolReason(message); got != reason {
+			t.Fatalf("reason for %q = %q", message, got)
+		}
+	}
+}
+
+func TestFindRetriesOneReadButSideEffectsRunAtMostOnce(t *testing.T) {
+	provider := &blockingProvider{started: make(chan model.Request, 1)}
+	state := &state{loop: newLoop(provider)}
+	token, err := readToken(strings.NewReader(validToken + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(routes(&auth{token: token}, state))
+	defer server.Close()
+	var finds, tasks, writes, shells atomic.Int32
+	client := dialRPCWith(t, server.URL, validToken, map[string]handler{
+		"runtime.find": func(_ context.Context, _ *rpc, _ json.RawMessage) (any, error) {
+			if finds.Add(1) == 1 {
+				return map[string]any{"ok": false, "error": map[string]any{
+					"reason": "busy", "message": "temporary read failure",
+				}}, nil
+			}
+			return map[string]any{"ok": true, "kind": "read", "lines": []any{}}, nil
+		},
+		"runtime.task": func(_ context.Context, _ *rpc, _ json.RawMessage) (any, error) {
+			tasks.Add(1)
+			return nil, errors.New("task t_missing is not registered")
+		},
+		"runtime.write": func(_ context.Context, _ *rpc, _ json.RawMessage) (any, error) {
+			writes.Add(1)
+			return nil, errors.New("approval denied")
+		},
+		"runtime.shell": func(_ context.Context, _ *rpc, _ json.RawMessage) (any, error) {
+			shells.Add(1)
+			return nil, errors.New("command timed out")
+		},
+	})
+	defer client.close()
+	peer := state.connection()
+	read := execTool(t.Context(), peer, nil, workerRole, callID{}, "task", model.Call{
+		ID: "read", Name: "find", Args: map[string]any{"path": "file.txt", "range": map[string]any{"start": 1, "end": 1}},
+	})
+	if read.Err != nil || read.Data["ok"] != true || read.Data["attempts"] != float64(2) && read.Data["attempts"] != 2 || finds.Load() != 2 {
+		t.Fatalf("read retry = %#v, calls=%d", read, finds.Load())
+	}
+	requests := []struct {
+		role, reason string
+		call         model.Call
+	}{
+		{orchestratorRole, "not_found", model.Call{ID: "task", Name: "task", Args: map[string]any{
+			"action": "update", "id": "t_missing", "status": "failed", "note": "missing",
+		}}},
+		{workerRole, "denied", model.Call{ID: "write", Name: "write", Args: map[string]any{
+			"path": "file", "content": "value",
+		}}},
+		{workerRole, "timeout", model.Call{ID: "shell", Name: "shell", Args: map[string]any{"command": "sleep 2"}}},
+	}
+	for _, request := range requests {
+		result := execTool(t.Context(), peer, nil, request.role, callID{}, "task", request.call)
+		if result.Err != nil || failureReason(result) != request.reason {
+			t.Fatalf("%s failure = %#v", request.call.Name, result)
+		}
+	}
+	if tasks.Load() != 1 || writes.Load() != 1 || shells.Load() != 1 {
+		t.Fatalf("side-effect calls task=%d write=%d shell=%d", tasks.Load(), writes.Load(), shells.Load())
+	}
+	client.close()
+	transport := execTool(t.Context(), peer, nil, workerRole, callID{}, "task", model.Call{
+		ID: "transport", Name: "find", Args: map[string]any{"query": "x"},
+	})
+	if transport.Err == nil {
+		t.Fatalf("transport failure was relabeled: %#v", transport)
+	}
+}
+
+type recoverProvider struct {
+	round int
+	err   error
+}
+
+func (p *recoverProvider) Stream(_ context.Context, _ string, request model.Request, yield func(model.Chunk) error) error {
+	p.round++
+	if p.round == 1 {
+		call := model.Call{ID: "duplicate", Name: "task", Args: map[string]any{
+			"action": "create", "title": "create typed task", "path": "/tmp/project",
+		}}
+		if err := yield(model.Chunk{Call: &call}); err != nil {
+			return err
+		}
+		return yield(model.Chunk{Call: &call})
+	}
+	if len(request.History) != 2 || len(request.History[1].Results) != 1 ||
+		failureReason(request.History[1].Results[0]) != "busy" {
+		p.err = errors.New("typed failure did not continue as one result")
+		return p.err
+	}
+	return yield(model.Chunk{Text: "recovered"})
+}
+
+func TestLoopContinuesAfterTypedFailureAndDeduplicatesStreamedCall(t *testing.T) {
+	provider := &recoverProvider{}
+	state := &state{loop: newLoop(provider)}
+	token, err := readToken(strings.NewReader(validToken + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(routes(&auth{token: token}, state))
+	defer server.Close()
+	var tasks atomic.Int32
+	client := dialRPCWith(t, server.URL, validToken, map[string]handler{
+		"runtime.live_env": func(context.Context, *rpc, json.RawMessage) (any, error) {
+			return liveState{Date: "2026-08-20"}, nil
+		},
+		"runtime.task": func(context.Context, *rpc, json.RawMessage) (any, error) {
+			tasks.Add(1)
+			return nil, errors.New("task t_active is still active")
+		},
+		"turn.chunk": func(context.Context, *rpc, json.RawMessage) (any, error) { return nil, nil },
+	})
+	defer client.close()
+	current := roleDefaults(limits{})[orchestratorRole]
+	request := model.Request{Model: current.Model, Tools: current.Tools}
+	err = state.loop.run(t.Context(), state.connection(), "key", &request, callID{Turn: "turn", Request: "request"}, current)
+	if err != nil || provider.err != nil || provider.round != 2 || tasks.Load() != 1 {
+		t.Fatalf("loop err=%v provider=%v rounds=%d calls=%d", err, provider.err, provider.round, tasks.Load())
+	}
+}
+
+func TestLostSideEffectResponseDoesNotRetry(t *testing.T) {
+	provider := &blockingProvider{started: make(chan model.Request, 1)}
+	state := &state{loop: newLoop(provider)}
+	token, err := readToken(strings.NewReader(validToken + "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(routes(&auth{token: token}, state))
+	defer server.Close()
+	var edits atomic.Int32
+	client := dialRPCWith(t, server.URL, validToken, map[string]handler{
+		"runtime.edit": func(_ context.Context, peer *rpc, _ json.RawMessage) (any, error) {
+			edits.Add(1)
+			peer.close()
+			return map[string]any{"ok": true}, nil
+		},
+	})
+	defer client.close()
+	result := execTool(t.Context(), state.connection(), nil, workerRole, callID{}, "task", model.Call{
+		ID: "edit", Name: "edit", Args: map[string]any{
+			"path": "file", "target": "old", "replacement": "new",
+		},
+	})
+	if result.Err == nil || edits.Load() != 1 {
+		t.Fatalf("lost response result=%#v calls=%d", result, edits.Load())
 	}
 }
